@@ -904,6 +904,63 @@ CHANNEL_SESSION_NAMESPACES: tuple[str, ...] = (
     "unified",
 )
 
+#: Session-key namespaces the OWNER controls end to end — the allowlist a
+#: cross-crew read authorizes against. Kept as a POSITIVE roster on purpose.
+#:
+#: A denylist of identity classes cannot secure this. Two classes slip an
+#: app-claim check alone: a channel-born session carries NO app claim
+#: (``derive_caller_app`` answers ``""`` for it), and the app-platform
+#: ``channel:{id}:{agent}`` prefix is absent from
+#: :data:`CHANNEL_SESSION_NAMESPACES` because ``messaging.link.parse_session_key``
+#: treats it as a legacy shape the classifiers do not cover. A denylist can only
+#: refuse the shapes already enumerated, so each addition closes one reported class
+#: and leaves the next unreported one open.
+#:
+#: A positive roster changes the direction of failure, which is the property worth
+#: having: an unrecognised namespace — a legacy shape, or one minted by a transport
+#: added after this line — is REFUSED. A missing entry here costs a legitimate
+#: caller a visible 403 that names itself; a missing denylist entry costs a peer's
+#: transcripts, silently.
+#:
+#: Enumerated from the namespaces ``SessionManager`` mints, and deliberately NOT
+#: derived from ``messaging.link``'s telemetry roster: that list exists to keep
+#: metric series apart and CONTAINS ``channel``, so deriving from it re-opens the
+#: hole this closes, and a label added for telemetry would silently widen
+#: authorization. The two rosters answer different questions and must drift
+#: independently.
+OWNER_CONTROLLED_SESSION_NAMESPACES: tuple[str, ...] = (
+    "dashboard",
+    "cron",
+    "subagent",
+    "taskrunner",
+    "secretary",
+    "side",
+    "wf",
+    "wf-pool",
+    "wf-author",
+)
+
+
+def is_owner_controlled_session_key(key: str) -> bool:
+    """True when *key* sits in a namespace the owner controls end to end.
+
+    Accepts both separator spellings for the same reason the channel classifier
+    does: a live session key uses ``:`` while a persisted filename stem uses ``_``
+    (``history._safe_key`` folds one to the other).
+
+    An EMPTY key answers False, and callers must not read that as a refusal on its
+    own — an absent ``X-Session-Key`` means no calling session was attested at all
+    (the gateway's own call, the CLI, a loopback ``curl``), which is a separate
+    question from a key that names an untrusted namespace. The crew-read guard
+    handles the two cases distinctly.
+    """
+    if not key:
+        return False
+    return key.startswith(
+        tuple(f"{ns}{sep}" for ns in OWNER_CONTROLLED_SESSION_NAMESPACES for sep in (":", "_"))
+    )
+
+
 #: The channels a PROACTIVE send may name -- ``send_message``'s ``channel_type``
 #: and its channel ``session`` values. Derived ONCE here rather than subtracted at
 #: each reader: the same subtraction was spelled in three places, which is the

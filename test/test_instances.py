@@ -2013,6 +2013,16 @@ class _FakeReq:
     def get(self, key, default=None):
         return self._attrs.get(key, default)
 
+    # aiohttp's Request IS a MutableMapping, and the owner guards depend on that:
+    # `is_owner_dashboard_request` distinguishes an ABSENT `app` key from one set
+    # to "" (a present empty claim is positive proof of the dashboard user), which
+    # is only expressible through `in` / `[]`.
+    def __contains__(self, key):
+        return key in self._attrs
+
+    def __getitem__(self, key):
+        return self._attrs[key]
+
     async def json(self):
         if self._body is None:
             raise ValueError("no body")
@@ -8024,3 +8034,657 @@ class TestSlugifyHashFallback:
         from kiro_crew.instances.registry import _slugify
 
         assert _slugify("Dev Box 2") == "dev-box-2"
+
+
+class _FakeContent:
+    """Minimal aiohttp resp.content stand-in: one-chunk async iterator."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    async def iter_chunked(self, _n):
+        if self._body:
+            yield self._body
+
+
+class _FakeResp:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self.content = _FakeContent(body)
+
+
+class TestCrewScopedSessionReads:
+    """MCP-only crew-scoped session reads (api_crew_sessions_search|list|read).
+
+    Direct-handler tests: STRICT internal-secret gate, unknown-crew 404, peer
+    reply reshaping, key vetting, and proxy-error mapping. The three back the
+    ``crew=`` scope on the kirocrew-core session read tools.
+    """
+
+    def _reg(self, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        return InstancesRegistry(path=tmp_path / "instances.json")
+
+    def _internal_req(self, state, **query):
+        # user=None models the real transport: token_auth's internal-secret branch
+        # sets `internal_auth` and derives identity from the CALLING SESSION, and
+        # never publishes a dashboard `user` claim (see `derive_caller_app`). A
+        # fake that supplied one would exercise a shape this route never sees.
+        req = _FakeReq(state, query=query, user=None)
+        req._attrs["internal_auth"] = True
+        return req
+
+    def _channel_req(self, state, **query):
+        """An internal-secret request whose CALLING SESSION is channel-born.
+
+        This is the identity an app-claim-only check could not see: a
+        channel/cron-born slot is created without an ``_app``, so
+        ``derive_caller_app`` returns ``""`` and ``request["app"]`` is left
+        absent — the Slack participant arrives shaped exactly like the owner.
+        """
+        req = _FakeReq(
+            state, query=query, user=None, headers={"X-Session-Key": "slack:1712345.678"}
+        )
+        req._attrs["internal_auth"] = True
+        return req
+
+    def _mgr_with(self, *, search=None, list_body=None, read_body=None, raise_exc=None):
+        import contextlib
+
+        class FakeMgr:
+            async def search_sessions_remote(self, iid, q, limit):
+                return search
+
+            @contextlib.asynccontextmanager
+            async def proxy_request(self, iid, method, path, *, params=None, **_k):
+                self.last_params = params
+                if raise_exc is not None:
+                    raise raise_exc
+                if path == "/api/sessions":
+                    yield _FakeResp(200, list_body or b"{}")
+                else:  # /api/sessions/{key}
+                    yield _FakeResp(200, read_body or b"[]")
+
+        return FakeMgr()
+
+    def test_search_requires_internal_secret(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        # A request WITHOUT internal_auth (a cookie fall-through) is refused.
+        req = _FakeReq(_State(reg, self._mgr_with()), query={"crew": "cd-1", "q": "hello"})
+        r = asyncio.run(handlers.api_crew_sessions_search(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "internal_secret_required"
+
+    def test_search_unknown_crew_404(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        state = _State(reg, self._mgr_with())
+        r = asyncio.run(
+            handlers.api_crew_sessions_search(self._internal_req(state, crew="nope", q="hello"))
+        )
+        assert r.status == 404
+        assert _body(r)["code"] == "crew_unknown"
+
+    def test_search_reshapes_and_resolves_by_name(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        payload = (
+            True,
+            {
+                "sessions": [
+                    {"key": "k1", "title": "Hello", "snippet": "world", "created": "2026-01-01"},
+                    {"title": "no key — dropped"},
+                ]
+            },
+        )
+        state = _State(reg, self._mgr_with(search=payload))
+        # Resolve the crew by NAME, not just id.
+        r = asyncio.run(
+            handlers.api_crew_sessions_search(self._internal_req(state, crew="CD", q="hello"))
+        )
+        assert r.status == 200
+        rows = _body(r)["sessions"]
+        assert [row["key"] for row in rows] == ["k1"]  # keyless row dropped
+        assert rows[0]["title"] == "Hello"
+
+    def test_search_maps_remote_failure(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        payload = (False, {"error": "peer rejected the credential", "code": "search_unauthorized"})
+        state = _State(reg, self._mgr_with(search=payload))
+        r = asyncio.run(
+            handlers.api_crew_sessions_search(self._internal_req(state, crew="cd-1", q="hello"))
+        )
+        assert r.status == 502
+        assert _body(r)["code"] == "search_unauthorized"
+
+    def test_list_reshapes_rows(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        body = json.dumps(
+            {"sessions": [{"key": "s1", "title": "T", "agent": "kiro", "messages": 4}]}
+        ).encode()
+        state = _State(reg, self._mgr_with(list_body=body))
+        r = asyncio.run(handlers.api_crew_sessions_list(self._internal_req(state, crew="cd-1")))
+        assert r.status == 200
+        rows = _body(r)["sessions"]
+        assert rows[0]["key"] == "s1" and rows[0]["messages"] == 4
+
+    def test_read_returns_tail_capped_messages(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        # api_session_detail returns a raw ARRAY; three messages, cap to 2.
+        body = json.dumps(
+            [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"},
+            ]
+        ).encode()
+        state = _State(reg, self._mgr_with(read_body=body))
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(
+                self._internal_req(state, crew="cd-1", key="k1", max_messages="2")
+            )
+        )
+        assert r.status == 200
+        msgs = _body(r)["messages"]
+        assert [m["content"] for m in msgs] == ["two", "three"]  # tail-capped
+
+    def test_read_rejects_traversal_key(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b"[]"))
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(self._internal_req(state, crew="cd-1", key="../secret"))
+        )
+        assert r.status == 400
+        assert _body(r)["code"] == "crew_bad_key"
+
+    def test_read_maps_proxy_error(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        exc = ProxyRequestError("proxy_peer_not_connected", "down", http_status=503)
+        state = _State(reg, self._mgr_with(raise_exc=exc))
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(self._internal_req(state, crew="cd-1", key="k1"))
+        )
+        assert r.status == 503
+        assert _body(r)["code"] == "proxy_peer_not_connected"
+
+    def test_search_drops_incognito_rows(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        payload = (
+            True,
+            {
+                "sessions": [
+                    {"key": "pub", "title": "Public"},
+                    {"key": "priv", "title": "Private", "memory_mode": "incognito"},
+                    {"key": "tmp", "title": "Temp", "memory_mode": "temporary"},
+                ]
+            },
+        )
+        state = _State(reg, self._mgr_with(search=payload))
+        r = asyncio.run(
+            handlers.api_crew_sessions_search(self._internal_req(state, crew="cd-1", q="hello"))
+        )
+        assert r.status == 200
+        # incognito + temporary rows excluded, mirroring the local tool.
+        assert [row["key"] for row in _body(r)["sessions"]] == ["pub"]
+
+    def test_list_drops_incognito_rows(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        body = json.dumps(
+            {
+                "sessions": [
+                    {"key": "pub", "title": "P"},
+                    {"key": "priv", "title": "X", "memory_mode": "incognito"},
+                ]
+            }
+        ).encode()
+        state = _State(reg, self._mgr_with(list_body=body))
+        r = asyncio.run(handlers.api_crew_sessions_list(self._internal_req(state, crew="cd-1")))
+        assert [row["key"] for row in _body(r)["sessions"]] == ["pub"]
+
+    def test_read_filters_to_recall_roles(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        body = json.dumps(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "content": "toolout"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        ).encode()
+        state = _State(reg, self._mgr_with(read_body=body))
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(self._internal_req(state, crew="cd-1", key="k1"))
+        )
+        # system + tool rows dropped, matching get_chat_session's RECALL_ROLES.
+        # (The endpoint returns raw roles; the MCP client is what title-cases.)
+        assert [m["role"] for m in _body(r)["messages"]] == ["user", "assistant"]
+
+    def test_resolve_prefers_exact_id_over_colliding_name(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        # Entry B's NAME equals entry A's ID; an exact id match must win.
+        reg.add(name="alpha", ssh_host="a-alias", instance_id="cd-1")
+        reg.add(name="cd-1", ssh_host="b-alias", instance_id="cd-2")
+        seen = {}
+        mgr = self._mgr_with(search=(True, {"sessions": [{"key": "k", "title": "t"}]}))
+        orig = mgr.search_sessions_remote
+
+        async def spy(iid, q, limit):
+            seen["iid"] = iid
+            return await orig(iid, q, limit)
+
+        mgr.search_sessions_remote = spy
+        state = _State(reg, mgr)
+        r = asyncio.run(
+            handlers.api_crew_sessions_search(self._internal_req(state, crew="cd-1", q="hello"))
+        )
+        assert r.status == 200
+        assert seen["iid"] == "cd-1"  # the entry whose ID is cd-1, not the one NAMED cd-1
+
+    def test_crew_pattern_accepts_display_names(self):
+        from kiro_crew.validation import _CREW_RE
+
+        assert _CREW_RE.match("chick")
+        assert _CREW_RE.match("My Crew")  # spaces allowed (display name)
+        assert _CREW_RE.match("crew-é")  # unicode allowed
+        assert not _CREW_RE.match("bad\nname")  # control char rejected
+        assert not _CREW_RE.match("")  # empty rejected
+
+    def test_crew_pattern_admits_any_name_the_registry_admits(self):
+        """``Instance.validate`` caps no length — it requires only a non-empty name.
+
+        A 64-char bound here refused a crew the operator can see in the roster, so
+        the selector is bounded at ``MAX_SHORT_STRING`` instead: the same limit
+        ``SELECT_CREW_SCHEMA``'s own ``crew`` field already uses. The bound is a
+        TRANSPORT one (the value rides a proxy query leg), not a semantic one.
+        """
+        from kiro_crew.validation import _CREW_RE, MAX_SHORT_STRING
+
+        assert _CREW_RE.match("x" * 65)  # the length the old {1,64} refused
+        assert _CREW_RE.match("x" * MAX_SHORT_STRING)
+        assert not _CREW_RE.match("x" * (MAX_SHORT_STRING + 1))  # still bounded
+
+    def test_the_three_read_tools_admit_the_same_crew_length_as_the_pattern(self):
+        """The schema ``max_len`` and the pattern must agree.
+
+        Two bounds on one field is how a value passes the regex and is then refused
+        by the field cap with a different message — so this pins them together
+        rather than trusting they were edited in step.
+        """
+        from kiro_crew.validation import (
+            GET_CHAT_SESSION_SCHEMA,
+            LIST_SESSIONS_SCHEMA,
+            MAX_SHORT_STRING,
+            SEARCH_CHAT_HISTORY_SCHEMA,
+        )
+
+        for schema in (SEARCH_CHAT_HISTORY_SCHEMA, LIST_SESSIONS_SCHEMA, GET_CHAT_SESSION_SCHEMA):
+            crew = next(f for f in schema.fields if f.name == "crew")
+            assert crew.max_len == MAX_SHORT_STRING, schema.tool_name
+
+    def test_read_requests_incognito_exclusion(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        mgr = self._mgr_with(read_body=json.dumps([{"role": "user", "content": "hi"}]).encode())
+        state = _State(reg, mgr)
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(self._internal_req(state, crew="cd-1", key="k1"))
+        )
+        assert r.status == 200
+        # read enforces incognito peer-side (not just the search/list discovery filter).
+        assert mgr.last_params == {"exclude_incognito": "1"}
+
+    def test_the_incognito_metadata_read_leaves_the_event_loop(self):
+        """``exclude_incognito`` must not stat and parse the transcript inline.
+
+        This is the arm the crew read turns on, and it is the ONE path a remote
+        agent can reach. ``get_metadata`` stats the file and parses its first line;
+        the adjacent ``read_messages`` call was already wrapped, so an inline
+        metadata read stalled every other request for the duration.
+
+        Asserted on the THREAD rather than by spying on ``asyncio.to_thread`` so it
+        pins the property (the read is off the loop) rather than the mechanism.
+        """
+        import threading
+
+        from kiro_crew.dashboard.handlers import sessions as sessions_handlers
+
+        seen: dict[str, str] = {}
+
+        class _Log:
+            def get_metadata(self, key):
+                seen["metadata"] = threading.current_thread().name
+                return {"memory_mode": "persistent"}
+
+            def read_messages(self, key):
+                seen["messages"] = threading.current_thread().name
+                return []
+
+        class _St:
+            conversation_log = _Log()
+
+        req = _FakeReq(_St(), match={"key": "k1"}, query={"exclude_incognito": "1"})
+
+        loop_thread: dict[str, str] = {}
+
+        async def _run():
+            loop_thread["name"] = threading.current_thread().name
+            return await sessions_handlers.api_session_detail(req)
+
+        r = asyncio.run(_run())
+        assert r.status == 200
+        assert seen["metadata"] != loop_thread["name"]
+        # The pre-existing wrap, asserted alongside so a regression on either is caught.
+        assert seen["messages"] != loop_thread["name"]
+
+    def test_crew_read_rejects_app_token_caller(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        # internal_auth is present, but the caller is an app-token identity
+        # (request["app"] set) — crew reads are owner-only, like the federated route.
+        req = _FakeReq(
+            _State(reg, self._mgr_with(read_body=b"[]")), query={"crew": "cd-1", "key": "k1"}
+        )
+        req._attrs["internal_auth"] = True
+        req._attrs["app"] = "some-app"
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    # ── the channel-minted identity an app-claim-only check could not refuse ──
+    #
+    # These three are the regression pins for the hole the previous denylist
+    # left: `if request.get("app")` alone admits a channel-born caller, because
+    # such a slot carries no app claim at all. One per route, since each route
+    # discloses a different slice of the peer (titles+snippets, session list,
+    # full transcript) and a guard added to one is not a guard on the others.
+
+    def test_search_rejects_channel_minted_caller(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(
+            reg, self._mgr_with(search=(True, {"sessions": [{"key": "k1", "title": "t"}]}))
+        )
+        req = self._channel_req(state, crew="cd-1", q="hello")
+        r = asyncio.run(handlers.api_crew_sessions_search(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    def test_list_rejects_channel_minted_caller(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(list_body=b'{"sessions": [{"key": "k1"}]}'))
+        req = self._channel_req(state, crew="cd-1")
+        r = asyncio.run(handlers.api_crew_sessions_list(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    def test_read_rejects_channel_minted_caller(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        req = self._channel_req(state, crew="cd-1", key="k1")
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    def _keyed_req(self, state, session_key, **query):
+        """An internal-secret request whose calling session carries *session_key*."""
+        req = _FakeReq(state, query=query, user=None, headers={"X-Session-Key": session_key})
+        req._attrs["internal_auth"] = True
+        return req
+
+    def _bare_req(self, state, **query):
+        """An internal-secret request with NO ``X-Session-Key`` at all."""
+        req = _FakeReq(state, query=query, user=None, headers={})
+        req._attrs["internal_auth"] = True
+        return req
+
+    def test_read_rejects_the_legacy_app_platform_channel_prefix(self, tmp_path, monkeypatch):
+        """``channel:{id}:{agent}`` is a channel caller the channel ROSTER omits.
+
+        ``CHANNEL_SESSION_NAMESPACES`` lists slack/discord/telegram but not
+        ``channel``, and ``parse_session_key`` names that prefix as a legacy shape
+        the classifiers deliberately do not cover — so a denylist keyed on the
+        roster admitted an app-platform channel agent. The allowlist refuses it
+        because the namespace is not one the owner controls, not because anyone
+        remembered to add it.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        req = self._keyed_req(state, "channel:C0123:some-agent", crew="cd-1", key="k1")
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    def test_read_rejects_an_unrecognised_caller_namespace(self, tmp_path, monkeypatch):
+        """The point of inverting the check: an unknown namespace fails CLOSED.
+
+        A transport minted after this guard was written has no denylist entry, so
+        a denylist would admit it. This asserts the direction of the failure, which
+        is the property that survives the next unforeseen identity class.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        req = self._keyed_req(state, "some-future-transport:42", crew="cd-1", key="k1")
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 403
+        assert _body(r)["code"] == "owner_only"
+
+    @pytest.mark.parametrize(
+        "session_key",
+        ["dashboard:ui", "dashboard_member-alice", "cron:nightly", "subagent:a1", "wf:run:1"],
+    )
+    def test_read_admits_every_owner_controlled_namespace(self, tmp_path, monkeypatch, session_key):
+        """The allowlist must not refuse the callers the feature exists for.
+
+        A fail-closed guard is only correct if the roster actually covers the
+        namespaces ``SessionManager`` mints; an over-narrow allowlist would 403 an
+        ordinary agent call. Parametrized so a future roster edit that drops one
+        of these is caught here rather than by a user.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        req = self._keyed_req(state, session_key, crew="cd-1", key="k1")
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status != 403
+
+    def test_read_admits_a_caller_with_no_session_key(self, tmp_path, monkeypatch):
+        """An ABSENT key is the gateway's own call, the CLI, a loopback curl.
+
+        Those already hold the internal secret and are the trust root this gate
+        stands on, so absence must stay admissible — the allowlist gates a key that
+        IS present, and must not turn "no attested subject" into a refusal.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        r = asyncio.run(
+            handlers.api_crew_sessions_read(self._bare_req(state, crew="cd-1", key="k1"))
+        )
+        assert r.status != 403
+
+    def test_a_non_string_memory_mode_from_a_peer_is_dropped_not_a_500(self, tmp_path, monkeypatch):
+        """A non-string ``memory_mode`` must not reach the frozenset membership test.
+
+        ``INCOGNITO_MEMORY_MODES`` is a ``frozenset``, so an unhashable value like
+        ``[]`` raises ``TypeError`` against it — a 500 rather than a refusal, on a
+        payload where only ``key`` is type-checked. The row is dropped (fail closed)
+        and the sibling still lists, which is what proves the guard is a filter and
+        not a bail-out.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        body = b'{"sessions": [{"key": "hostile", "memory_mode": []}, {"key": "ordinary"}]}'
+        state = _State(reg, self._mgr_with(list_body=body))
+        r = asyncio.run(handlers.api_crew_sessions_list(self._internal_req(state, crew="cd-1")))
+        assert r.status == 200
+        keys = [row["key"] for row in _body(r)["sessions"]]
+        assert "hostile" not in keys
+        assert "ordinary" in keys
+
+    def test_a_row_with_no_memory_mode_is_still_listed(self, tmp_path, monkeypatch):
+        """An ABSENT mode is the ordinary case, not a restricted one.
+
+        Most rows carry no ``memory_mode`` at all, so a type guard that treated a
+        missing mode as restricted would drop nearly every legitimate row — the
+        opposite failure from the crash it fixes.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(list_body=b'{"sessions": [{"key": "plain"}]}'))
+        r = asyncio.run(handlers.api_crew_sessions_list(self._internal_req(state, crew="cd-1")))
+        assert r.status == 200
+        assert [row["key"] for row in _body(r)["sessions"]] == ["plain"]
+
+    def test_a_string_incognito_mode_is_still_excluded(self, tmp_path, monkeypatch):
+        """The membership test itself must survive the type guard."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        body = b'{"sessions": [{"key": "secret", "memory_mode": "incognito"}, {"key": "ok"}]}'
+        state = _State(reg, self._mgr_with(list_body=body))
+        r = asyncio.run(handlers.api_crew_sessions_list(self._internal_req(state, crew="cd-1")))
+        assert r.status == 200
+        assert [row["key"] for row in _body(r)["sessions"]] == ["ok"]
+
+    def test_read_admits_a_dashboard_calling_session(self, tmp_path, monkeypatch):
+        """The guard refuses a channel NAMESPACE, not every session key.
+
+        Without this, "refuse channel keys" could be satisfied by refusing every
+        keyed caller — which would break the ordinary agent call the feature
+        exists for.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        req = _FakeReq(
+            state,
+            query={"crew": "cd-1", "key": "k1"},
+            user=None,
+            headers={"X-Session-Key": "dashboard_chat-2026-09-15"},
+        )
+        req._attrs["internal_auth"] = True
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 200
+
+    def test_read_rejects_a_non_owner_dashboard_subject(self, tmp_path, monkeypatch):
+        """A `!dashboard`-minted browser subject reaching a reclassified route.
+
+        `local_only=False` reclassifies a strict-internal path as mixed, so a
+        cookie-authenticated subject can arrive here. A PRESENT user claim must
+        therefore be the configured owner, not merely authenticated.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        state.owner_id = "the-owner"
+        req = _FakeReq(state, query={"crew": "cd-1", "key": "k1"}, user="slack-guest")
+        req._attrs["internal_auth"] = True
+        req._attrs["app"] = ""  # a dashboard-context claim, but the WRONG subject
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 403
+
+    def test_read_admits_the_owner_dashboard_subject(self, tmp_path, monkeypatch):
+        """The owner-subject arm is a check, not a blanket refusal of user claims."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        state = _State(reg, self._mgr_with(read_body=b'[{"role": "user", "content": "hi"}]'))
+        state.owner_id = "the-owner"
+        req = _FakeReq(state, query={"crew": "cd-1", "key": "k1"}, user="the-owner")
+        req._attrs["internal_auth"] = True
+        req._attrs["app"] = ""
+        r = asyncio.run(handlers.api_crew_sessions_read(req))
+        assert r.status == 200
