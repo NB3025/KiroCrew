@@ -264,6 +264,7 @@ FORCED_AGENT_SETTINGS: Mapping[str, object] = {
     "sandbox": "auto",
     "sandbox_allow_no_isolation": False,
     "sandbox_allow_unsandboxed_exec": False,
+    "sandbox_forward_ssh_auth_sock": False,
 }
 
 
