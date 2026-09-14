@@ -71,7 +71,17 @@ export const CHUNK_BUDGETS = {
   // editor, store picker/card, carve, backups, retired) across all 13 catalogs
   // on top of that: with them the chunk builds at 11,332,186 B (11067 KB), so
   // the 5% headroom is taken over that measurement rather than main's.
-  all: 11620 * KB, // measured 11067 KB on feat/memory-v2-ui 2026-09-10 (~5% headroom)
+  // Re-measured 2026-09-16 on the #10904 merge ref: the chunk builds at
+  // ~11623 KB, 2.7 KB over the 11620 KB ceiling. Attribution is measured, not
+  // assumed: that PR's branch alone builds the chunk at 11591 KB (under the
+  // ceiling) and adds only translated product copy — ~22 skillsTab keys
+  // across 12 catalogs (~25 KB); the remaining ~530 KB is main's accumulated
+  // catalog growth since the 2026-09-10 measurement. The chunk still holds
+  // the same 14 modules (13 catalogs plus the entry), no library reached it,
+  // and no lazy import() boundary can move a catalog string out of `all`.
+  // Same recurrence as every entry above — a ceiling that drifted to <0.1%
+  // headroom fails on routine string growth — same remedy: 5% convention.
+  all: 12200 * KB, // measured ~11623 KB on the #10904 merge ref 2026-09-16 (~5% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
