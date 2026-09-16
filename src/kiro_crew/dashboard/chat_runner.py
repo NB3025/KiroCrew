@@ -248,6 +248,7 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.mcp_discovery import kirocrew_managed_names
 from kiro_crew.members import member_lifecycle, record_activity
+from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -9145,7 +9146,7 @@ async def _run_chat(
             # A compaction on the PREVIOUS turn dropped the session-start
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
-            _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            _needs_reinjection = consume_reinjection(state.sessions, session_key)
             # Stand up this crew's OWN vector store before the offloaded build.
             # It has to happen here, on the loop, because init() is blocking file
             # IO (sqlite connect, migrations, a FAISS load) that build_message's
@@ -15270,11 +15271,12 @@ async def _run_chat(
         # Re-arming here (the one block on EVERY exit path) makes the next turn
         # rebuild the member section; the rules read inside stays fail-closed
         # until the user repairs or clears the file.
-        if (_needs_reinjection or _member_session_start_pending) and not _turn_landed:
-            try:
-                state.sessions.mark_needs_reinjection(session_key)
-            except Exception:
-                logger.debug("re-arming skills re-injection failed", exc_info=True)
+        rearm_reinjection(
+            state.sessions,
+            session_key,
+            consumed=_needs_reinjection or _member_session_start_pending,
+            landed=_turn_landed,
+        )
         # ── AutoNudge: (re)arm the idle timer on EVERY turn-exit path. ──
         # Must be in finally, not the happy path: a turn that ends via timeout
         # / AcpProcessDied / AcpError / cancel would otherwise never re-arm,

@@ -74,7 +74,10 @@ from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_auto_approve,
     build_directive_consumer,
+    consume_reinjection,
     delivery_is_muted,
+    driver_turn_landed,
+    rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -748,6 +751,10 @@ class DiscordDispatcher:
                 return MonitorDispatchResult.BUSY
             raise
         attachment_temp_paths: list[str] = []
+        # Post-compaction re-injection bookkeeping for the finally: whether this
+        # turn consumed the one-shot flag, and whether it landed (recorded success).
+        _needs_reinjection = False
+        _turn_landed = False
 
         # Everything acquire-dependent runs INSIDE the try so the finally
         # always finalizes the renderer; release() is gated on _acquired.
@@ -851,6 +858,10 @@ class DiscordDispatcher:
             # `!sessions` resume of a crew-bound conversation out of the operator's
             # own memory. Its private tier was prepared before provider
             # acquisition; an unavailable member store refuses the turn.
+            # A compaction drops session-start context. Read-and-clear the
+            # one-shot flag so this turn re-injects that context exactly once;
+            # the finally re-arms it if this turn never lands.
+            _needs_reinjection = consume_reinjection(self.sessions, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message,
@@ -861,6 +872,7 @@ class DiscordDispatcher:
                 agent=agent,
                 memory_store=_memory_store,
                 resumed=resumed,
+                needs_reinjection=_needs_reinjection,
                 runtime_source="discord",
                 context_provider=provider,
             )
@@ -921,6 +933,13 @@ class DiscordDispatcher:
                 monitor_completion=monitor_completion,
             )
             accumulated = await driver.run(full_message)
+            # Landed is decided by the provider turn alone, the moment run()
+            # returns: the prompt (with any re-injected context) is in the
+            # conversation iff the completion classifies succeeded. Delivery is
+            # judged separately below -- a reply Discord failed to carry is
+            # recorded a failure, but the context it carried has already landed,
+            # and re-arming would inject it a second time on the next turn.
+            _turn_landed = driver_turn_landed(driver)
             if monitor_completion is not None:
                 if not monitor_completion.accepted:
                     return MonitorDispatchResult.UNAVAILABLE
@@ -1068,6 +1087,12 @@ class DiscordDispatcher:
             if _acquired:
                 await self.sessions.record_failure(session_key)
         finally:
+            # A turn that consumed the post-compaction flag but never landed
+            # discarded the prompt carrying the re-injected context; put the
+            # flag back so the next turn re-injects it.
+            rearm_reinjection(
+                self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+            )
             # Renderer finalization is best-effort and must NEVER prevent the
             # session release below — a rendering failure (e.g. Discord/proxy
             # returning a malformed body) that also failed finalization would

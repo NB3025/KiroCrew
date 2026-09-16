@@ -98,7 +98,12 @@ from kiro_crew.messaging.commands import (
     spawn_command_reply,
     task_command_reply,
 )
-from kiro_crew.messaging.dispatch import admit_inbound_callback
+from kiro_crew.messaging.dispatch import (
+    admit_inbound_callback,
+    consume_reinjection,
+    rearm_reinjection,
+    stop_reason_landed,
+)
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
@@ -3322,6 +3327,10 @@ async def handle_message(
     status_ctrl.set_phase("queued")
     _had_error = False
     _stop_reason = ""
+    # Whether the stream delivered an EVENT_COMPLETE; ``_stop_reason`` alone
+    # cannot say (it is "" both before any completion and for one that carries
+    # no reason), and the re-injection bookkeeping needs the difference.
+    _completion_observed = False
 
     # Set assistant thread status while we wait for the LLM to respond.
     # Defer start_stream until the first text chunk arrives so the user
@@ -3631,6 +3640,10 @@ async def handle_message(
             await _hydrate_thread_overrides(session_key, conversation_log)
 
     client: LLMProvider | None = None
+    # Post-compaction re-injection bookkeeping for the finally: whether this
+    # turn consumed the one-shot flag, and whether it landed (recorded success).
+    _needs_reinjection = False
+    _turn_landed = False
     try:
         task.start()
         while True:
@@ -3813,6 +3826,10 @@ async def handle_message(
             #
             # The private tier was prepared before provider acquisition. Missing
             # or unreadable member memory refuses the turn with its own error.
+            # A compaction drops session-start context. Read-and-clear the
+            # one-shot flag so this turn re-injects that context exactly once;
+            # the finally re-arms it if this turn never lands.
+            _needs_reinjection = consume_reinjection(sessions, session_key)
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_message, _ = await run_in_embed_pool(
                 context_builder.build_message,
@@ -3824,6 +3841,7 @@ async def handle_message(
                 agent=_agent,
                 memory_store=_memory_store,
                 resumed=resumed,
+                needs_reinjection=_needs_reinjection,
                 user_display_name=user_display_name,
                 compressed_history=compressed,
                 action_context=action_context,
@@ -4272,6 +4290,7 @@ async def handle_message(
             elif event.kind == EVENT_COMPLETE:
                 status_ctrl.on_progress()
                 _stop_reason = event.stop_reason
+                _completion_observed = True
                 if (
                     _stop_reason
                     and _stop_reason != STOP_REASON_END_TURN
@@ -4293,6 +4312,15 @@ async def handle_message(
         else:
             task.complete()
             sessions.record_success(session_key)
+            # The prompt (with any re-injected context) reached the model and
+            # the turn completed, so the finally must NOT restore the flag --
+            # only for a succeeded stop reason on an observed completion: a
+            # synthetic completion for a wedged turn (stale_recover, tool stall)
+            # did not deliver it, and a stream that ended without any
+            # completion proves nothing.
+            _turn_landed = stop_reason_landed(
+                (_stop_reason or "") if _completion_observed else None
+            )
             Stats().inc_message_success()
             # Per-interaction telemetry (PlatformContext seam) — shared helper so
             # the payload shape and model reflection cannot drift across surfaces.
@@ -4363,6 +4391,10 @@ async def handle_message(
         await sessions.record_failure(session_key)
         Stats().inc_message_failed()
     finally:
+        # A turn that consumed the post-compaction flag but never landed (an
+        # error arm, a cancel) discarded the prompt carrying the re-injected
+        # context; put the flag back so the next turn re-injects it.
+        rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
         if _acquired:
             sessions.release(session_key)
         status_ctrl.finalize(error=_had_error)
