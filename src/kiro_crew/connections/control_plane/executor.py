@@ -168,8 +168,8 @@ from kiro_crew.connections.control_plane.writes import (
 #: required ``payload`` (see :data:`~kiro_crew.connections.control_plane.result.RESULT_SCHEMA_VERSION`
 #: ``2``) and :class:`ExecutionOutcome` exposes it as :attr:`ExecutionOutcome.payload`.
 #: An old pin would decode this wrong in the way that matters most: it would read
-#: a success as carrying status + cursor and nothing else, which is exactly what
-#: the whole success path used to be -- so a consumer written against ``2`` drops
+#: a success as carrying status + cursor and nothing else -- so a consumer written
+#: against ``2`` drops
 #: every item, object and byte the operation returned rather than failing loudly.
 #:
 #: ``4`` is two more outer-shape changes:
@@ -799,7 +799,7 @@ class PageWalk:
     ``{**base_args, "cursor": cursor}``. Sending the cursor alone would silently
     drop the filter set from page 2 onward -- a different query than page 1 --
     and would change the request's ``args_fingerprint``, so L07's attribution
-    would no longer recognize a retry of a page as the same logical request.
+    would fail to recognize a retry of a page as the same logical request.
 
     ``done`` is True once the last page returned no ``next_cursor`` (or a gate
     denied / a transport error stopped the walk). ``pages`` counts the pages

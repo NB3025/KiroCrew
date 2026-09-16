@@ -46,9 +46,6 @@ from kiro_crew.connections.control_plane import (
     ResolvedCredential,
     SecretRef,
     VerifiedIdentity,
-)
-from kiro_crew.connections.control_plane import binding as binding_mod
-from kiro_crew.connections.control_plane import (
     binding_secret_ref,
     create_binding,
     next_generation,
@@ -625,22 +622,18 @@ def test_binding_symbols_are_reachable_via_control_plane_not_the_top_level() -> 
 
 # --- L04 · binding lifecycle: trusted store, single-writer rotation, revoke ---
 #
-# Round-24 repair. Four defects were read out of the round-23 code, and each is
-# closed here with a "prove the failure / prove the refusal path is really taken"
-# test alongside the fix:
-#   1. assert_live used `<` and did not compare identity -> a forged future
-#      generation passed, and another binding's generation passed. Now: EXACT
-#      generation equality AND identity match.
-#   2. uniqueness could be bypassed by reusing a binding_id with changed domain
-#      fields, and a corrupt store was read as empty (erasing every binding on
-#      the next write). Now: domain-enforced regardless of id, and fail-closed on
-#      a corrupt store.
-#   3. rotate's lock covered only the counter/ref bump, not the REAL token
-#      refresh -> two processes could both refresh. Now: the refresh callable
-#      runs INSIDE the lock; a controlled endpoint is hit exactly once.
-#   4. `instance` meant the KiroCrew instance (backwards). Now `deployment_id`
-#      means the PROVIDER-side deployment, and the Kiro principal -> authorization
-#      link is enforced in resolve, not merely documented.
+# Each test proves both a failure it must reject and that the refusal path is
+# really taken, across four properties of the lifecycle:
+#   1. assert_live requires EXACT generation equality AND an identity match, so a
+#      forged future generation and another binding's generation are both refused.
+#   2. uniqueness is domain-enforced regardless of binding_id, and a corrupt store
+#      fails closed rather than reading as empty (which would erase every binding
+#      on the next write).
+#   3. rotate holds the lock across the REAL token refresh, not merely the
+#      counter/ref bump: the refresh callable runs INSIDE the lock, so a
+#      controlled endpoint is hit exactly once even under two processes.
+#   4. `deployment_id` means the PROVIDER-side deployment, and the Kiro principal
+#      -> authorization link is enforced in resolve, not merely documented.
 
 
 def _store_verifier(*, claimed_subject, claimed_tenant, service_id) -> VerifiedIdentity:
@@ -723,16 +716,13 @@ def test_resolution_reads_from_the_store_not_a_caller_iterable(tmp_path) -> None
 
 def test_a_caller_supplied_candidate_outside_the_trusted_store_is_refused(tmp_path) -> None:
     fabricated = _mk_binding(subject="alice", tenant="acme")
-    # (a) The DEFECT half of this counter-example -- L02's
-    # `resolve_binding_for_principal([fabricated], ...)` matching over a
-    # caller-supplied Iterable and happily returning `fabricated` -- is NOT
-    # reproducible on this branch: that function lands with L02's own commit,
-    # which is not in this history (this branch's binding.py has no such
-    # entry point). What IS pinned here is the structural half of the fix: the
-    # trusted store's resolve takes NO caller candidate set at all, so there is
-    # no parameter through which `fabricated` could be offered.
+    # The structural fix pinned here: the trusted store's resolve takes NO caller
+    # candidate set, so there is no parameter through which `fabricated` could be
+    # offered. L02's `resolve_binding_for_principal` (a pure matcher over a
+    # caller-supplied Iterable) is present in this integration tree, but the STORE
+    # never routes a resolution through a caller-supplied set -- it reads its own
+    # persisted records.
     assert "bindings" not in inspect.signature(BindingStore.resolve).parameters
-    assert not hasattr(binding_mod, "resolve_binding_for_principal")
     # (b) the trusted store never admitted it -> refused.
     store = _fresh_store(tmp_path)
     with pytest.raises(BindingResolutionError):
@@ -967,28 +957,57 @@ def test_only_one_process_rotates_under_contention(tmp_path) -> None:
             str(observed),
             endpoint,
         ]
-        p1 = subprocess.Popen(common + [str(barrier), str(out1)], env=env)
-        p2 = subprocess.Popen(common + [str(barrier), str(out2)], env=env)
-        time.sleep(0.3)
-        barrier.write_text("go", encoding="utf-8")
-        assert p1.wait(timeout=60) == 0
-        assert p2.wait(timeout=60) == 0
+        p1 = None
+        p2 = None
+        try:
+            # Each worker in its OWN process group (start_new_session) with cwd under
+            # tmp_path, so the finally below can reap the whole group and nothing is
+            # left running (or writing outside tmp_path) if an assert or wait fails.
+            p1 = subprocess.Popen(
+                common + [str(barrier), str(out1)],
+                env=env,
+                cwd=str(tmp_path),
+                start_new_session=True,
+            )
+            p2 = subprocess.Popen(
+                common + [str(barrier), str(out2)],
+                env=env,
+                cwd=str(tmp_path),
+                start_new_session=True,
+            )
+            time.sleep(0.3)
+            barrier.write_text("go", encoding="utf-8")
+            assert p1.wait(timeout=60) == 0
+            assert p2.wait(timeout=60) == 0
 
-        r1 = json.loads(out1.read_text())
-        r2 = json.loads(out2.read_text())
-        with hits_lock:
-            endpoint_hits = hits["n"]
-        print(
-            f"\n[CONTENTION EVIDENCE] worker1={r1}\n[CONTENTION EVIDENCE] worker2={r2}\n"
-            f"[CONTENTION EVIDENCE] TOKEN ENDPOINT HITS={endpoint_hits} "
-            f"(must be 1) final_store_generation="
-            f"{store.get(b['binding_id'])['live_generation']} observed={observed}"
-        )
-        rotated = [r for r in (r1, r2) if r["did_rotate"]]
-        # The judgement: the REAL provider endpoint was hit exactly once.
-        assert endpoint_hits == 1, f"token endpoint hit {endpoint_hits} times; r1={r1} r2={r2}"
-        assert len(rotated) == 1, f"expected one rotation, r1={r1} r2={r2}"
-        assert store.get(b["binding_id"])["live_generation"] == observed + 1
+            r1 = json.loads(out1.read_text())
+            r2 = json.loads(out2.read_text())
+            with hits_lock:
+                endpoint_hits = hits["n"]
+            print(
+                f"\n[CONTENTION EVIDENCE] worker1={r1}\n[CONTENTION EVIDENCE] worker2={r2}\n"
+                f"[CONTENTION EVIDENCE] TOKEN ENDPOINT HITS={endpoint_hits} "
+                f"(must be 1) final_store_generation="
+                f"{store.get(b['binding_id'])['live_generation']} observed={observed}"
+            )
+            rotated = [r for r in (r1, r2) if r["did_rotate"]]
+            # The judgement: the REAL provider endpoint was hit exactly once.
+            assert endpoint_hits == 1, f"token endpoint hit {endpoint_hits} times; r1={r1} r2={r2}"
+            assert len(rotated) == 1, f"expected one rotation, r1={r1} r2={r2}"
+            assert store.get(b["binding_id"])["live_generation"] == observed + 1
+        finally:
+            # Reap both workers on every exit path (including a failed wait/assert):
+            # terminate and wait each, so no subprocess outlives the test.
+            for proc in (p1, p2):
+                if proc is None:
+                    continue
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=10)
     finally:
         server.shutdown()
         server.server_close()
@@ -1046,7 +1065,7 @@ def test_rotate_swaps_secret_ref_from_the_refresh_result(tmp_path) -> None:
 
 def test_deployment_id_is_a_provider_deployment_not_a_kiro_instance(tmp_path) -> None:
     # The corrected direction: the SAME provider account resolved from what would
-    # be two different KiroCrew instances is still ONE binding (same deployment),
+    # be two different Kiro Crew instances is still ONE binding (same deployment),
     # while the SAME account on two different provider deployments is TWO.
     store = _fresh_store(tmp_path)
     b = _mk_binding(subject="alice", tenant="acme")
@@ -1317,7 +1336,7 @@ def test_DEFECTB_pre_fix_reinsert_with_changed_pri_or_mode_silently_returns_old(
 def test_assert_live_returns_the_trusted_store_binding(tmp_path) -> None:
     import inspect
 
-    # The signature no longer promises None.
+    # The signature does not promise None.
     ann = inspect.signature(BindingStore.assert_live).return_annotation
     assert ann is not None
     assert ann is not inspect.Signature.empty
@@ -1567,7 +1586,11 @@ def test_JUDGEMENT_fencing_reads_the_live_store_after_revoke(tmp_path) -> None:
     vault, name = _vault_for(store, b, "live")
     # Before revoke: selector works.
     ok = store.select_secret(handle, reader=vault)
-    print(f"\n[SELECTOR EVIDENCE] before-revoke: got secret for {name} = {ok['secret'].reveal()!r}")
+    # Do NOT log the secret VALUE (py/clear-text-logging-sensitive-data): the
+    # evidence is that the selector resolved a secret for this name, referenced
+    # by name only. The value stays on the resolved credential, never printed.
+    assert ok["secret"].reveal() != ""
+    print(f"\n[SELECTOR EVIDENCE] before-revoke: resolved a secret for {name} (value not logged)")
     # Revoke, then the SAME handle is fenced by a fresh live-store read.
     store.revoke(b["binding_id"])
     try:

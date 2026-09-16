@@ -411,7 +411,7 @@ class BindingStore:
         This is the ``resolve(principal, provider, account)`` seam the downstream
         ACL calls, re-founded on a trusted source: the candidate set is the
         PERSISTED store's own records, never an ``Iterable`` the caller passed in,
-        so a caller can no longer smuggle a binding it does not own into the
+        so a caller cannot smuggle a binding it does not own into the
         candidate set.
 
         It enforces, in order:
@@ -588,7 +588,7 @@ class BindingStore:
         refresh both pass the same observed generation. The lock serializes them;
         the winner rotates, calls ``refresh`` once, advances ``live_generation``,
         and returns ``(record, True)``; the LOSER, on acquiring the lock, re-reads,
-        finds ``live_generation`` no longer equals its ``observed_generation``, and
+        finds ``live_generation`` differs from its ``observed_generation``, and
         returns ``(winner_record, False)`` WITHOUT calling ``refresh`` or rotating.
 
         Raises :class:`BindingResolutionError` if the id is unknown,

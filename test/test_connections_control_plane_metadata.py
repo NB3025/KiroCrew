@@ -102,7 +102,7 @@ def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> 
 def _bound() -> Tuple[Binding, DerivedHandle]:
     """A binding and a handle derived from it (the binding is needed to fence)."""
 
-    from kiro_crew.connections.control_plane.binding import create_binding
+    from kiro_crew.connections.control_plane.binding import binding_secret_ref, create_binding
 
     binding = create_binding(
         service_id="outlook",
@@ -112,6 +112,10 @@ def _bound() -> Tuple[Binding, DerivedHandle]:
         verifier=_verifier,  # type: ignore[arg-type]
         slug="outlook",
     )
+    # L02's create_binding records a per-binding scoped secret_ref name; pin it to
+    # the slug name the shared real_vault fixture seeds so the fenced read resolves.
+    binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
+    binding["secret_ref"]["name"] = binding_secret_ref("outlook")["name"]
     handle = derive_handle(
         binding,
         granted_scopes=_GRANTED,
@@ -492,3 +496,43 @@ def test_a_transport_that_says_nothing_still_gives_a_caller_an_empty_mapping() -
     assert dict(ExecutionOutcome().metadata) == {}
     assert ExecutionOutcome().metadata.get("retry-after") is None
     assert TransportResponse(http_status=204).metadata is EMPTY_RESPONSE_METADATA
+
+
+def test_an_allowlisted_header_whose_value_echoes_the_bearer_is_dropped() -> None:
+    """The allowlist gates the NAME; a VALUE that echoes the outbound bearer drops.
+
+    A provider that reflects the request's credential into an allowlisted header
+    (here `etag`, whose name is allowed) would otherwise hand the token back to
+    the caller through `.metadata`. When the outbound `sent_credential` is known,
+    such a value is dropped; an unrelated allowlisted value on the same reply is
+    kept, so the strip is by-value, not by-name.
+    """
+
+    bearer = "s3cr3t-token-value"
+    metadata = response_metadata(
+        {
+            "ETag": bearer,  # provider echoed the token into an allowlisted header
+            "Retry-After": "30",  # a genuine, unrelated allowlisted value
+            "X-RateLimit-Remaining": f"tok={bearer}",  # embedded, not equal
+        },
+        sent_credential=bearer,
+    )
+    # The echoed value and the embedded-echo value are both gone.
+    assert "etag" not in metadata
+    assert "x-ratelimit-remaining" not in metadata
+    # The unrelated allowlisted value survives.
+    assert metadata["retry-after"] == "30"
+    # And the token appears in no metadata value.
+    assert all(bearer not in v for v in metadata.values())
+
+
+def test_without_a_sent_credential_the_projection_is_unchanged() -> None:
+    """The value-strip is a no-op when no outbound credential is supplied.
+
+    Callers that do not know the credential (there are none on this path, but the
+    parameter is optional) get the pure name-allowlist behaviour.
+    """
+
+    metadata = response_metadata({"ETag": "abc123", "Retry-After": "30"})
+    assert metadata["etag"] == "abc123"
+    assert metadata["retry-after"] == "30"

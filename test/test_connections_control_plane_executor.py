@@ -823,6 +823,11 @@ def _bound(**kw) -> tuple[Binding, DerivedHandle]:
     """A binding plus a handle derived from it (the binding is what gets fenced)."""
 
     binding = kw.pop("binding", None) or _binding()
+    # L02's create_binding records a per-binding scoped secret_ref name; these
+    # tests seed the slug name into the vault, so pin the default binding's ref to
+    # the slug name so the fenced live-store read resolves.
+    binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
+    binding["secret_ref"]["name"] = binding_secret_ref("outlook")["name"]
     return binding, _handle(binding=binding, **kw)
 
 

@@ -26,6 +26,7 @@ another delivered ``Bearer <token>`` to the second server.
 from __future__ import annotations
 
 import datetime
+import http.client
 import http.server
 import socket
 import ssl
@@ -163,6 +164,13 @@ def _bound(**kw: Any) -> Tuple[Binding, DerivedHandle]:
     """A binding plus a handle derived from it (the binding is what gets fenced)."""
 
     binding = _binding(**{k: v for k, v in kw.items() if k in ("subject", "tenant", "slug")})
+    # The single-binding tests pair a `_bound()` binding with the shared real_vault
+    # fixture, which seeds the slug name. L02's create_binding records a per-binding
+    # scoped name, so pin this default binding's secret_ref to the slug name the
+    # fixture holds. Tests that need two DISTINCT per-binding names build via
+    # `_binding(...)` directly and stamp their own names.
+    binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
+    binding["secret_ref"]["name"] = binding_secret_ref("outlook")["name"]
     requested = kw.get("requested", ("mail.read",))
     return binding, _handle(binding, requested=requested)
 
@@ -354,6 +362,7 @@ def _handler_for(
 def _https_server(handler_cls: Any, certfile: Path, keyfile: Path) -> Iterator[int]:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certfile), str(keyfile))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -624,9 +633,9 @@ def test_a_transport_refuses_a_call_from_another_binding_and_never_reads_the_vau
     """The counterexample: composed for X, called for Y -> refuse, resolve nothing.
 
     Both bindings are the SAME service and the SAME credential mode -- the two
-    axes the executor used to pass -- and differ only in the verified
-    subject/tenant behind them. That is precisely the pair the old composition
-    could not tell apart.
+    axes the executor passes -- and differ only in the verified
+    subject/tenant behind them. That is precisely the pair a slug-keyed composition
+    cannot tell apart.
     """
 
     binding_x = _binding(subject="alice", tenant="acme")
@@ -748,10 +757,11 @@ def test_the_send_path_takes_the_entry_name_from_the_store_never_from_the_slug(
 ) -> None:
     """The closed gap, pinned: per-binding separation is REAL on the send path now.
 
-    This used to be a NAMED GAP -- the transport derived the vault entry name with
+    This closes a NAMED GAP -- a transport that derived the vault entry name with
     :func:`~kiro_crew.connections.control_plane.binding.binding_secret_ref` from the
-    provider SLUG alone, so two bindings of the SAME provider (different subjects,
-    different tenants) resolved the SAME vault entry. Per-binding custody was
+    provider SLUG alone would resolve the SAME vault entry for two bindings of the
+    SAME provider (different subjects,
+    different tenants). Per-binding custody would be
     apparent, not real.
 
     It is closed by resolving through L04's live store: the name comes from the
@@ -818,9 +828,10 @@ def test_the_send_path_takes_the_entry_name_from_the_store_never_from_the_slug(
 def test_l04_generation_fencing_is_judged_on_the_send_path(tmp_path: Path) -> None:
     """The other closed gap: the send path now judges ``generation``, via the store.
 
-    This used to say "the selector matches a BINDING, not a generation" -- a
-    handle from generation N still resolved after the binding moved to N+1,
-    because nothing on this path compared generations. The live-store fence
+    Without this fence a "selector matches a BINDING, not a generation" design --
+    a handle from generation N still resolving after the binding moves to N+1,
+    because nothing on the path compares generations -- would leak a stale
+    credential. The live-store fence
     (``assert_live`` inside ``select_secret``) compares them EXACTLY, so a stale
     generation is refused with nothing emitted and no vault read.
     """
@@ -1123,6 +1134,67 @@ def test_feeding_that_unknown_into_l07_refuses_a_blind_replay(
             descriptor, misrecorded, request_args=args, request_idempotency_key="idem-7"
         )["verdict"]
         == REPLAY_ALLOW
+    )
+
+
+def test_a_server_committed_then_disconnect_records_unknown_and_l07_refuses_replay(
+    tmp_path: Path,
+    real_vault: RecordingVault,
+) -> None:
+    """A raw ``http.client.RemoteDisconnected`` on a write -> ``unknown``, replay refused.
+
+    Guards the escape a narrow ``except (URLError, TimeoutError, ...)``
+    tuple leaves open. ``RemoteDisconnected`` is a ``ConnectionResetError``
+    (-> ``ConnectionError``) AND an ``http.client.BadStatusLine``
+    (-> ``HTTPException``), but is NOT a ``URLError``, so a server that COMMITTED
+    the write and then dropped the reply would propagate the exception past a
+    ``URLError``-only
+    branch -- no ``write_outcome=unknown``, so no L07 replay-gate protection, so a
+    blind retry would double-send. The fix names ``ConnectionError`` and
+    ``http.client.HTTPException`` in the tuple; this pins the outcome as ``unknown``
+    (NOT ``failed_not_applied``) and asserts L07 refuses the replay.
+    """
+
+    def _committed_then_dropped(request: HttpRequest, *, timeout_seconds: float) -> HttpReply:
+        raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+    descriptor = _write_descriptor()
+    binding, handle = _bound(requested=("mail.send",))
+    transport = build_production_transport(
+        gate=_gate_for(binding, handle),
+        store=_live_store(tmp_path, binding),
+        vault=real_vault,
+        locator=_locator_to(
+            "https://graph.example.invalid/v1/me/sendMail", method="POST", body=b"{}"
+        ),
+        http_send=_committed_then_dropped,
+    )
+    args = {"to": "someone@example.invalid"}
+    outcome = execute(
+        descriptor,
+        handle,
+        transport,
+        request_args=args,
+        request_idempotency_key="idem-disc-1",
+        **_kw(governance_item="messages.send"),
+    )
+    # The exception does not escape: a structured ambiguous outcome instead.
+    assert outcome.error is not None
+    assert outcome.write_outcome == ATTEMPT_UNKNOWN
+    assert outcome.write_outcome != ATTEMPT_FAILED_NOT_APPLIED
+
+    # And L07 refuses to replay the non-idempotent write on that `unknown`.
+    record = record_attempt(
+        operation_id=descriptor["operation_id"],
+        args_fingerprint=args_fingerprint(args),
+        idempotency_key="idem-disc-1",
+        outcome="unknown",
+    )
+    assert (
+        replay_decision(
+            descriptor, record, request_args=args, request_idempotency_key="idem-disc-1"
+        )["verdict"]
+        == REPLAY_REFUSE
     )
 
 

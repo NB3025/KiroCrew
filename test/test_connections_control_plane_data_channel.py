@@ -103,7 +103,7 @@ def _verifier(*, claimed_subject: str, claimed_tenant: str, service_id: str) -> 
 def _bound(*, requested: Tuple[str, ...] = ("mail.read",)) -> Tuple[Binding, DerivedHandle]:
     """A binding and a handle derived from it (the binding is what gets fenced)."""
 
-    from kiro_crew.connections.control_plane.binding import create_binding
+    from kiro_crew.connections.control_plane.binding import binding_secret_ref, create_binding
 
     binding = create_binding(
         service_id="outlook",
@@ -113,6 +113,10 @@ def _bound(*, requested: Tuple[str, ...] = ("mail.read",)) -> Tuple[Binding, Der
         verifier=_verifier,  # type: ignore[arg-type]
         slug="outlook",
     )
+    # L02's create_binding records a per-binding scoped secret_ref name; pin it to
+    # the name the shared real_vault fixture seeds so the fenced read resolves.
+    binding["secret_ref"] = dict(binding["secret_ref"])  # type: ignore[typeddict-item]
+    binding["secret_ref"]["name"] = binding_secret_ref("outlook")["name"]
     handle = derive_handle(
         binding,
         granted_scopes=_GRANTED,
@@ -325,8 +329,9 @@ def test_a_consumer_receives_the_items_and_the_cursor_of_every_page(
 def test_the_cursor_lives_on_the_envelope_and_nowhere_else() -> None:
     """ITEM 1's pin: there is exactly ONE cursor, and it is the envelope's.
 
-    ``CollectionPayload`` used to carry a second copy, defended as "deliberate
-    duplication written by one constructor". That defence only covered envelopes
+    A ``CollectionPayload`` carrying a second copy would invite the defence of
+    "deliberate
+    duplication written by one constructor". That defence only covers envelopes
     built through that constructor: an ``OperationResult`` is a ``TypedDict``, so a
     producer can build one literally and a middle layer can reassign
     ``next_cursor`` on the mapping it was handed. When the two disagree a walk
