@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Matches the plain-text quarantine/context fence keyword phrase, tolerant of
 # case, surrounding dashes, and whitespace, so attacker-controlled forwarded
-# text cannot forge a boundary line. Used to neutralize embedded markers BEFORE
+# text cannot forge a boundary line. Neutralizes embedded markers BEFORE
 # the fence is interpolated around untrusted content.
 _FENCE_MARKER_RE = re.compile(
     r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",

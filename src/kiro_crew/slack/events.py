@@ -2004,7 +2004,7 @@ def _has_share_attachments(event: dict) -> bool:
 def _first_share_attachment(event: dict) -> dict:
     """Return the first forwarded-message share attachment, or ``{}`` if none.
 
-    Used to source provenance (``author_id`` / ``channel_id`` / ``ts`` /
+    Supplies the provenance (``author_id`` / ``channel_id`` / ``ts`` /
     ``from_url``) for the untrusted-content fence. When one event forwards
     several messages, the first share attachment supplies the provenance anchor.
     """
