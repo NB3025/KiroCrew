@@ -48,9 +48,10 @@ from kiro_crew.connections.control_plane.handle import (
     derive_handle,
     ensure_usable,
 )
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
-    BindingSecretSelector,
+    BindingCustodyGate,
     HttpReply,
     HttpRequest,
     urllib_http_send,
@@ -116,14 +117,35 @@ def _handle(binding: Binding, *, requested: Tuple[str, ...] = ("repo",)) -> Deri
     )
 
 
-def _selector_for(handle: DerivedHandle) -> BindingSecretSelector:
+def _gate_for(binding: Binding, handle: DerivedHandle) -> BindingCustodyGate:
+    """W01's per-binding custody gate: a function of the trusted handle view.
+
+    ``trusted_binding_for`` returns THIS binding only when the executor-resolved
+    view's identity matches the one composed here, else raises
+    ``BindingIdentityMismatchError`` and resolves nothing (no store, no vault).
+    """
+
     view = ensure_usable(handle, now=_T0)
-    return BindingSecretSelector(
-        slug=GITHUB_SLUG,
-        binding_fingerprint=view.binding_fingerprint,
-        service_id=view.service_id,
-        credential_mode=view.credential_mode,
-    )
+    return BindingCustodyGate(
+        binding=binding, binding_fingerprint=view.binding_fingerprint)
+
+
+def _store_for(root: Path, *bindings: Binding) -> BindingStore:
+    """A REAL on-disk L04 ``BindingStore`` holding ``bindings`` -- not a stub.
+
+    ``build_production_transport`` resolves the credential per call via
+    ``store.select_secret``, reading the ``secret_ref`` off the LIVE record, so
+    the binding under custody must actually live in the store.
+    """
+
+    store = BindingStore(root / "connections" / "control_plane_bindings.json")
+    for index, binding in enumerate(bindings):
+        store.insert(
+            binding,
+            deployment_id=f"deployment://test/github/{index}",
+            kiro_principal="kiro://test/owner",
+        )
+    return store
 
 
 def _gate_kwargs(**over: Any) -> Dict[str, Any]:
@@ -276,7 +298,12 @@ def test_real_structured_fetch_across_two_pages_over_tls(
 
     binding = _binding()
     handle = _handle(binding)
-    selector = _selector_for(handle)
+    gate = _gate_for(binding, handle)
+    store = _store_for(tmp_path, binding)
+    # W01 mints a per-binding secret name (no slug collapse), so seed the vault
+    # under THIS binding's own secret_ref name -- the fixture's slug-derived name
+    # would miss and the transport would return HTTP 401.
+    real_vault.set_sync(binding["secret_ref"]["name"], "gh-installation-token")
 
     with _https_server(handler, certfile, keyfile) as port:
         port_ref["port"] = port
@@ -291,7 +318,8 @@ def test_real_structured_fetch_across_two_pages_over_tls(
 
         transport = build_github_transport(
             operation_id="gh_list_pull_requests",
-            selector=selector,
+            gate=gate,
+            store=store,
             vault=real_vault,
             http_send=urllib_http_send,
         )
@@ -355,6 +383,25 @@ def test_locator_rest_cursor_is_the_absolute_link_url_verbatim() -> None:
         request_args={CURSOR_ARG: next_url},
     )
     assert req.url == next_url  # sent verbatim, not re-derived
+
+
+def test_locator_refuses_cross_origin_pagination_cursor() -> None:
+    # A crafted Link header pointing at another origin must be REFUSED: the
+    # production transport would otherwise attach the binding's bearer token to
+    # the attacker host. A scheme check alone is not enough -- the origin
+    # (scheme+host+port) must equal GITHUB_API_BASE's.
+    descriptor = __import__(
+        "kiro_crew.connections.vendors.github.descriptors",
+        fromlist=["get_descriptor"],
+    ).get_descriptor("gh_list_pull_requests")
+    for evil in (
+        "https://evil.example.com/repositories/1/pulls?page=2",
+        "https://api.github.com.evil.com/x?page=2",  # look-alike host prefix
+        "https://api.github.com:8443/x?page=2",       # wrong port
+        "http://api.github.com/x?page=2",             # wrong scheme
+    ):
+        with pytest.raises(GithubLocatorError):
+            build_request(descriptor=descriptor, request_args={CURSOR_ARG: evil})
 
 
 def test_locator_refuses_unknown_operation() -> None:
@@ -480,7 +527,9 @@ def test_decode_for_refuses_mixed() -> None:
 # =============================================================================
 # dispatch drives the REAL gate chain: a denied gate emits nothing
 # =============================================================================
-def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -> None:
+def test_dispatch_denied_gate_never_reaches_transport(
+    tmp_path: Path, real_vault: SecretVault
+) -> None:
     sent: List[HttpRequest] = []
 
     def _spy_send(request: HttpRequest, **_: Any) -> HttpReply:
@@ -489,10 +538,12 @@ def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -
 
     binding = _binding()
     handle = _handle(binding)
-    selector = _selector_for(handle)
+    gate = _gate_for(binding, handle)
+    store = _store_for(tmp_path, binding)
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=selector,
+        gate=gate,
+        store=store,
         vault=real_vault,
         http_send=_spy_send,
     )
@@ -516,22 +567,26 @@ def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -
 # =============================================================================
 # multi-binding: W01's per-binding selector, not a local substitute
 # =============================================================================
-def test_wrong_binding_selector_refuses_and_sends_nothing(real_vault: SecretVault) -> None:
+def test_wrong_binding_gate_refuses_and_sends_nothing(
+    tmp_path: Path, real_vault: SecretVault
+) -> None:
     sent: List[HttpRequest] = []
 
     def _spy_send(request: HttpRequest, **_: Any) -> HttpReply:
         sent.append(request)
         return HttpReply(status=200, headers={}, body=b"[]")
 
-    # A handle for binding A, but a selector composed for a DIFFERENT binding B.
+    # A handle for binding A, but a gate composed for a DIFFERENT binding B.
     handle_a = _handle(_binding(subject="a"))
     binding_b = _binding(subject="b")
     handle_b = _handle(binding_b)
-    selector_b = _selector_for(handle_b)
+    gate_b = _gate_for(binding_b, handle_b)
+    store = _store_for(tmp_path, binding_b)
 
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=selector_b,  # custody for B
+        gate=gate_b,  # custody for B
+        store=store,
         vault=real_vault,
         http_send=_spy_send,
     )
@@ -543,19 +598,20 @@ def test_wrong_binding_selector_refuses_and_sends_nothing(real_vault: SecretVaul
         request_args={"owner": "o", "repo": "r"},
         clock=lambda: _T0,
     )
-    # W01's BindingSecretSelector refuses -> transport returns a typed auth
-    # failure and never sent anything nor resolved a secret.
+    # W01's BindingCustodyGate refuses (BindingIdentityMismatchError) -> transport
+    # returns a typed auth failure, never sent anything nor resolved a secret.
     assert outcome.error is not None
     assert sent == []
 
 
-def test_schema_versions_are_the_ones_this_builds_against() -> None:
+def test_schema_versions_are_the_ones_this_builds_against(tmp_path: Path) -> None:
     # build_github_transport asserts these; call it and confirm no drift raised.
     binding = _binding()
     handle = _handle(binding)
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=_selector_for(handle),
+        gate=_gate_for(binding, handle),
+        store=_store_for(tmp_path, binding),
         vault=SecretVault_stub(),
         http_send=lambda request, **_: HttpReply(status=200, headers={}, body=b"[]"),
     )
@@ -567,3 +623,59 @@ class SecretVault_stub:
 
     def get(self, name: str) -> Optional[SecretValue]:
         return SecretValue("x")
+
+
+# =============================================================================
+# F4: a large listing (>100 pages) must COMPLETE, not abort every round
+# =============================================================================
+class _FakeWalk:
+    """A minimal PageWalk stand-in: yields ``pages`` non-terminal pages, then
+    sets done. Terminates via its OWN done flag (as W01's repeated-cursor guard
+    would), so walk_pages must pump it to the end without a page-count cap."""
+
+    def __init__(self, pages: int) -> None:
+        self._remaining = pages
+        self.done = False
+
+    def next(self):  # noqa: A003 - mirrors PageWalk.next
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self.done = True
+        return object()  # an opaque per-page outcome; walk_pages only collects
+
+
+def test_walk_pages_completes_a_listing_over_100_pages() -> None:
+    # 250 pages > the old max_pages=100 ceiling that used to abort. walk_pages
+    # must drive it to completion (W01's done flag is the terminator).
+    walk = _FakeWalk(pages=250)
+    outcomes = walk_pages(walk)
+    assert len(outcomes) == 250
+    assert walk.done
+
+
+def test_walk_pages_runaway_ceiling_still_guards_a_nonterminating_walk() -> None:
+    # A walk that NEVER sets done (a provider defeating W01's guard) must still
+    # be bounded by the last-resort runaway ceiling rather than loop forever.
+    class _NeverDone:
+        done = False
+
+        def next(self):  # noqa: A003
+            return object()
+
+    with pytest.raises(GithubDispatchError):
+        walk_pages(_NeverDone(), runaway_ceiling=32)
+
+
+# =============================================================================
+# F3: the issues/pulls list must carry state=all so a CLOSE is not filtered out
+# =============================================================================
+def test_locator_passes_state_filter_into_issues_query() -> None:
+    descriptor = __import__(
+        "kiro_crew.connections.vendors.github.descriptors",
+        fromlist=["get_descriptor"],
+    ).get_descriptor("gh_list_issues_rest")
+    req = build_request(
+        descriptor=descriptor,
+        request_args={"owner": "octo", "repo": "hello", "state": "all"},
+    )
+    assert "state=all" in req.url  # a supported filter, forwarded verbatim

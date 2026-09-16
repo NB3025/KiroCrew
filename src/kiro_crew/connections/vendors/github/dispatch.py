@@ -16,9 +16,10 @@ It consumes, and RE-IMPLEMENTS NOTHING, of W01's judgment chain:
 * auth / handle trust / credential-mode permit / five-layer governance /
   write-replay all run inside ``execute`` -- this module supplies the inputs and
   never re-decides any of them;
-* custody is W01's ``BindingSecretSelector`` + ``resolve_binding_secret``, bound
-  per call to the trusted binding identity -- multi-binding therefore goes
-  through W01's per-binding selector (e8), never a local substitute;
+* custody is W01's ``BindingCustodyGate`` (a function of the trusted handle
+  view) + L04's ``BindingStore.select_secret``, fenced per call to the trusted
+  binding identity -- multi-binding therefore goes through W01's per-binding
+  live-store selection (e8), never a local substitute;
 * the transport is W01's ``build_production_transport`` with GitHub's own
   ``locator`` / ``decoder`` injected -- the ONLY sender. Nothing here touches
   ``urllib`` / ``requests`` / ``httpx``.
@@ -37,8 +38,9 @@ Pinned so a shape change in the seam this consumes is a visible break:
 * ``EXECUTOR_SCHEMA_VERSION == 4`` -- the executor envelope now exposes
   ``ExecutionOutcome.payload`` (the neutral data channel) beside the
   transport callable and paging surface this drives.
-* ``PRODUCTION_SCHEMA_VERSION == 3`` -- ``build_production_transport`` takes a
-  ``BindingSecretSelector`` (per-call custody) and threads the payload through.
+* ``PRODUCTION_SCHEMA_VERSION == 4`` -- ``build_production_transport`` takes a
+  ``BindingCustodyGate`` + an L04 ``BindingStore`` (per-call fence + live-store
+  credential selection) and threads the payload through.
 * ``RESULT_SCHEMA_VERSION == 3`` -- ``OperationResult`` carries a single
   authoritative ``next_cursor`` plus the ``payload`` union
   (collection/object/bytes); the cursor lives ONLY on the envelope.
@@ -51,7 +53,8 @@ WHAT THIS DELIBERATELY DOES NOT OWN
 ===================================
 No auth, no custody, no retry, no fencing, no error classification, no
 pagination engine -- all W01's. No credential ever reaches this module: it hands
-the transport a ``vault`` (a ``SecretStore``) and a ``selector``; the secret is
+the transport a ``vault`` (a ``SecretStore``), a ``gate`` and the live
+``store``; the secret is
 resolved inside the transport, revealed once into a header there, and never seen
 here. It opens no socket.
 """
@@ -71,6 +74,7 @@ from kiro_crew.connections.control_plane.executor import (
     execute,
 )
 from kiro_crew.connections.control_plane.handle import DerivedHandle
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.operation import (
     OPERATION_SCHEMA_VERSION,
     CredentialMode,
@@ -81,7 +85,7 @@ from kiro_crew.connections.control_plane.operation import (
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
     PRODUCTION_SCHEMA_VERSION,
-    BindingSecretSelector,
+    BindingCustodyGate,
     ResultDecode,
     SecretStore,
     build_production_transport,
@@ -101,9 +105,10 @@ from kiro_crew.connections.vendors.github.descriptors import (
 from kiro_crew.connections.vendors.github.locator import locate
 
 #: The provider slug whose vault-secret family a GitHub binding's credential
-#: belongs to (registry.json ``slug``: ``github``). ``binding_secret_ref`` on
-#: W01's binding derives ``CONNECTIONS_GITHUB_BINDING_SECRET`` from it; a
-#: ``BindingSecretSelector`` for a GitHub binding is composed with this slug.
+#: belongs to (registry.json ``slug``: ``github``). ``create_binding(slug=...)``
+#: sets the binding's own ``secret_ref`` from it; L04's ``select_secret`` then
+#: reads that ref off the LIVE STORE record per binding -- the slug is not what
+#: the transport resolves against, only how the binding's secret is seeded.
 GITHUB_SLUG = "github"
 
 #: The neutral service range GitHub operations route at (L01 closed set).
@@ -113,7 +118,7 @@ GITHUB_SERVICE_ID: ServiceId = "github"
 #: a downstream reader sees exactly what shapes it pins, and
 #: :func:`assert_schema_versions` can fail loudly on a drift.
 BUILT_AGAINST_EXECUTOR_SCHEMA = 4
-BUILT_AGAINST_PRODUCTION_SCHEMA = 3
+BUILT_AGAINST_PRODUCTION_SCHEMA = 4
 BUILT_AGAINST_RESULT_SCHEMA = 3
 BUILT_AGAINST_OPERATION_SCHEMA = 2
 
@@ -258,7 +263,8 @@ def decode_for(operation_id: str) -> ResultDecode:
 def build_github_transport(
     *,
     operation_id: str,
-    selector: BindingSecretSelector,
+    gate: BindingCustodyGate,
+    store: BindingStore,
     vault: SecretStore,
     http_send: Optional[Any] = None,
 ) -> Transport:
@@ -267,11 +273,13 @@ def build_github_transport(
     Asserts the W01 seam is the version this pins, then hands
     :func:`~kiro_crew.connections.control_plane.production.build_production_transport`
     GitHub's own ``locate`` locator and the operation's ``decode_for`` decoder.
-    Custody is W01's: the ``selector`` (composed for the call's binding) and the
-    ``vault`` go straight to the production module, which resolves the secret per
-    call and reveals it into a header there -- no credential is seen here. The
-    returned :class:`Transport` is the ONLY sender; this module never opens a
-    socket.
+    Custody is W01's: the ``gate`` (a function of the call's trusted handle view,
+    composed for one binding identity), the live L04 ``store`` and the ``vault``
+    go straight to the production module, which per call fences the binding via
+    the gate, resolves the credential from the LIVE STORE's own record
+    (``store.select_secret``), and reveals it into a header there -- no credential
+    is seen here. The returned :class:`Transport` is the ONLY sender; this module
+    never opens a socket.
 
     ``http_send`` is W01's own
     :data:`~kiro_crew.connections.control_plane.production.HttpSend` injection
@@ -282,15 +290,17 @@ def build_github_transport(
     which resolves custody and attaches the credential; the seam only replaces
     the socket at the bottom.
 
-    A ``selector`` composed for the WRONG binding refuses every call inside the
+    A ``gate`` composed for the WRONG binding refuses every call inside the
     transport (W01's ``BindingIdentityMismatchError`` -> a typed ``auth``
-    failure), so multi-binding is W01's per-binding selection, not a local one.
+    failure) BEFORE the store or vault is asked, so multi-binding is W01's
+    per-binding fence + live-store selection, not a local one.
     """
 
     assert_schema_versions()
     decode = decode_for(operation_id)
     kwargs: dict[str, Any] = dict(
-        selector=selector,
+        gate=gate,
+        store=store,
         vault=vault,
         locator=locate,
         decode=decode,
@@ -386,32 +396,35 @@ def open_page_walk(
     return PageWalk(**walk_kwargs)
 
 
-def walk_pages(walk: PageWalk, *, max_pages: int = 100) -> List[ExecutionOutcome]:
+def walk_pages(walk: PageWalk, *, runaway_ceiling: int = 1_000_000) -> List[ExecutionOutcome]:
     """Drive a :class:`PageWalk` to completion, returning each page's outcome.
 
     Calls W01's :func:`~kiro_crew.connections.control_plane.executor.advance_page`
-    until the walk sets ``done`` (a terminal page, a denied gate, a transport
-    error, or a 412), collecting the :class:`ExecutionOutcome` of every page. It
-    adds no paging logic of its own -- W01's ``PageWalk`` decides cursor advance,
-    repeated-cursor termination and per-page re-authorization; this only pumps
-    it and bounds the loop.
+    until the walk sets ``done`` (a terminal page with no ``next_cursor``, a
+    denied gate, a transport error, a 412, OR W01's own repeated-cursor guard
+    that terminates a non-advancing walk). It adds no paging logic of its own --
+    W01's ``PageWalk`` decides cursor advance, repeated-cursor termination and
+    per-page re-authorization; this only pumps it to the end.
 
-    ``max_pages`` is a defensive ceiling so a caller cannot spin unboundedly even
-    if a provider misbehaved past W01's own repeated-cursor guard; reaching it
-    raises :class:`GithubDispatchError` rather than looping forever.
+    It does NOT cap the page count at a data-bearing limit: a legitimately large
+    repository (a first full ``since=None`` sync can exceed any small ceiling)
+    must complete rather than abort every round. W01's repeated-cursor guard is
+    the real terminator; ``runaway_ceiling`` is only a last-resort backstop
+    against a provider that both misbehaves AND defeats that guard, set so high
+    that no real listing reaches it. Reaching it raises
+    :class:`GithubDispatchError` rather than looping forever.
     """
 
     outcomes: List[ExecutionOutcome] = []
-    for _ in range(max_pages):
-        if walk.done:
-            break
+    pages = 0
+    while not walk.done:
         outcomes.append(advance_page(walk))
-        if walk.done:
-            break
-    else:
-        raise GithubDispatchError(
-            f"page walk did not terminate within {max_pages} pages"
-        )
+        pages += 1
+        if pages >= runaway_ceiling:
+            raise GithubDispatchError(
+                f"page walk exceeded the runaway ceiling ({runaway_ceiling} "
+                "pages) without W01's repeated-cursor guard terminating it"
+            )
     return outcomes
 
 

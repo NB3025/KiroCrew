@@ -55,6 +55,11 @@ from .pagination import (
     next_page_url,
     parse_link_header,
 )
+from .permissions import (
+    probe_collaborator_subjects,
+    probe_repo_is_private,
+    resolve_repo_subjects,
+)
 from .rate_limit import RateLimitSnapshot, read_rate_limit
 from .signatures import known_tool_names, resolve_operation_id
 
@@ -75,6 +80,9 @@ __all__ = [
     "clamp_per_page",
     "next_page_url",
     "parse_link_header",
+    "probe_collaborator_subjects",
+    "probe_repo_is_private",
+    "resolve_repo_subjects",
     "RateLimitSnapshot",
     "read_rate_limit",
     "known_tool_names",

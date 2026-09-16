@@ -290,10 +290,21 @@ def build_request(
     cursor = request_args.get(CURSOR_ARG)
     if cursor is not None and pagination is Pagination.REST_PAGE:
         url = str(cursor)
-        if not url.lower().startswith("https://"):
+        # A crafted Link header could point the "next page" at any origin; the
+        # production transport then attaches the binding's bearer token to
+        # whatever host this URL names. So the cursor's ORIGIN (scheme + host +
+        # port) MUST equal GITHUB_API_BASE's origin -- a scheme check alone would
+        # let a cross-origin URL carry the credential to an attacker. Compared as
+        # parsed components (not string prefix) so a look-alike host that merely
+        # starts with the base string cannot slip through.
+        base = urllib.parse.urlsplit(GITHUB_API_BASE)
+        got = urllib.parse.urlsplit(url)
+        if (got.scheme.lower(), got.hostname, got.port) != (
+            base.scheme.lower(), base.hostname, base.port
+        ):
             raise GithubLocatorError(
-                "REST pagination cursor must be the provider's absolute https "
-                f"Link-header URL, got {url!r}"
+                "REST pagination cursor must be an absolute URL on the same "
+                f"origin as {GITHUB_API_BASE!r}, got {url!r}"
             )
         return HttpRequest(method=method, url=url, headers=_default_headers(), body=None)
 

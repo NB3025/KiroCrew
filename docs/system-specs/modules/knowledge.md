@@ -506,9 +506,20 @@ builds a real `knowledge.rows.SourceRow` per record, and returns
 - each `row` is a `SourceRow` carrying its own `key` (the primary-key identity),
   `text` (the row's projection), `resource_ref` (the GitHub
   `knowledge.acl.ProviderResourceRef` — `provider="github"`, `account=owner`, and
-  the documented locator: `{owner, repo, number}` for an issue/PR, `{owner, repo,
-  sha}` for a commit, `{owner, repo, check_run_id}` for a check-run), and `tenant`
-  (the repo owner, non-empty);
+  the documented locator, each ALSO carrying `endpoint` — the trusted execution
+  host the dispatch locator actually targets (read from
+  `vendors.github.locator.GITHUB_API_BASE`): `{endpoint, owner, repo, number}`
+  for an issue/PR, `{endpoint, owner, repo, sha}` for a commit, `{endpoint,
+  owner, repo, check_run_id}` for a check-run. `endpoint` exists because
+  `ProviderResourceRef` has no host field of its own, so without it the same
+  `owner/repo/number` on two GitHub deployments is indistinguishable. NAMED GAP:
+  `GITHUB_API_BASE` is a single module constant, so it cannot yet express a
+  per-source/per-binding GitHub Enterprise host — a trusted per-binding endpoint
+  on the transport composition is still needed), and `tenant`
+  (a PROVIDER-SUPPLIED tenant string carried on the transport bundle — NOT the
+  repo owner, and NOT yet a proven-verified identity: the trusted view the W01
+  executor returns exposes no `tenant_ref` today, so this slice cannot verify it
+  and every row stays fail-closed regardless; see the open tenant question);
 - **`subjects` is an EMPTY tuple — explicit deny-all — for every row**, the
   confirmed-correct fail-closed state: this slice has no authorization evidence
   mapping a GitHub object to the subjects allowed to see it, and real evidence
