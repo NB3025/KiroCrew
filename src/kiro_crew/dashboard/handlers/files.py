@@ -75,6 +75,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.doc_blocks import extract_blocks
 from kiro_crew.doc_parser import extract_text
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.github_runner import validate_provider_executable
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -6560,6 +6561,7 @@ _GIT_PANEL_STDOUT_CAP = 8 * 1024 * 1024
 def _run_git_bounded(
     args: list[str], cwd: str, env: dict, timeout: float,
     cap: int = _GIT_PANEL_STDOUT_CAP,
+    decode_errors: str = "replace",
 ) -> tuple[int, str, bool]:
     """Run git capturing at most ``cap`` bytes of stdout.
 
@@ -6567,6 +6569,11 @@ def _run_git_bounded(
     outlives ``timeout`` or overflows ``cap`` it is killed and reported as
     truncated with a nonzero returncode -- callers already treat nonzero as
     "no data", which is the safe degraded answer for a pathological repo.
+
+    ``decode_errors`` is ``"replace"`` for display-bound output. A caller
+    whose output names a filesystem path fed to an ``os`` call passes
+    ``"surrogateescape"`` so non-UTF-8 path bytes round-trip through
+    ``os.fsencode`` (see :func:`kiro_crew.subprocess_utf8.utf8_path_stdout`).
     """
     # OS-sandbox + credential-scrubbed env chokepoint (worktree.py's _run_git
     # pattern): the repository content is agent-influenced, and git filter
@@ -6621,7 +6628,7 @@ def _run_git_bounded(
             rc = -9
         if timed_out or overflow:
             rc = rc or -9
-        return rc, bytes(buf).decode("utf-8", "replace"), timed_out or overflow
+        return rc, bytes(buf).decode("utf-8", decode_errors), timed_out or overflow
     finally:
         if cleanup:
             with contextlib.suppress(OSError):
@@ -6674,6 +6681,33 @@ _GIT_FILTER_KEY_RE = re.compile(
 )
 
 
+def _worktree_probe_failure_is_empty_scope(
+    git_cmd: list[str], base: str, env: dict
+) -> bool:
+    """True when a failed ``--worktree`` probe hit the empty scope git creates lazily.
+
+    Called only AFTER ``git config --worktree ...`` exited non-zero — never to
+    gate whether that probe runs. Resolves ``$GIT_DIR`` through this handler's
+    own bounded runner and feeds it to
+    :func:`kiro_crew.git_worktree_scope.worktree_probe_failure_is_empty_scope`,
+    the one shared classification all four filter-driver guards use. See that
+    module's docstring for why the probe-first order is the contract.
+    """
+    # surrogateescape, not the display default: this answer is handed to the
+    # classifier's ``os.lstat``, so a non-UTF-8 byte in the real path must
+    # survive as a PEP 383 surrogate ``os.fsencode`` restores byte-exactly --
+    # a U+FFFD from ``"replace"`` would miss an existing ``config.worktree``
+    # and clear a scope git still reads.
+    gitdir_rc, gitdir_out, _ = _run_git_bounded(
+        [*git_cmd, "rev-parse", "--absolute-git-dir"],
+        cwd=base, env=env, timeout=5,
+        decode_errors="surrogateescape",
+    )
+    return worktree_probe_failure_is_empty_scope(
+        gitdir_out if gitdir_rc == 0 else "", base
+    )
+
+
 def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bool:
     """True when repo-supplied config names a content-filter driver (or the
     probe cannot prove it does not).
@@ -6681,17 +6715,28 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
     Mirrors ``worktree.py::_checkout_filter``: drivers can only come from a
     config file the repository supplies — ``--local`` (``.git/config``) and,
     when ``extensions.worktreeConfig`` is on, ``--worktree``
-    (``$GIT_DIR/config.worktree``). ``--includes`` is mandatory: a specific-scope
+    (``$GIT_DIR/config.worktree``). The worktree scope is PROBED FIRST and a
+    failure classified AFTERWARDS: git creates ``config.worktree`` lazily, so
+    a probe that failed because the file is genuinely absent is the empty
+    scope, not an unreadable one — while an existence pre-check would drop
+    the scope on a stale fact and never look at a file git goes on to read.
+    ``--includes`` is mandatory: a specific-scope
     query defaults include-following OFF, so a driver reached through
     ``include.path`` would be invisible to the probe yet still execute.
     Global/system config is deliberately not probed (the user's own machine
-    setup, e.g. ``git lfs install``, is not repository-supplied). A probe that
-    fails refuses: an unreadable scope cannot be proven filter-free. The probe
-    itself is safe — ``git config`` reads files and never runs drivers.
+    setup, e.g. ``git lfs install``, is not repository-supplied). Any other
+    probe failure refuses: an unreadable scope cannot be proven filter-free.
+    The probe itself is safe — ``git config`` reads files and never runs
+    drivers.
     """
     scopes = ["--local"]
+    # --local is load-bearing: git takes the extension from the REPO config
+    # only, while a merged read lets a worktree-scoped
+    # extensions.worktreeConfig=false win the chain and hide the very scope it
+    # lives in. --bool folds every git-true spelling (yes/on/1/valueless).
     ext_rc, ext_out, _ = _run_git_bounded(
-        [*git_cmd, "config", "--bool", "--get", "extensions.worktreeConfig"],
+        [*git_cmd, "config", "--local", "--includes", "--bool", "--get",
+         "extensions.worktreeConfig"],
         cwd=base, env=env, timeout=5,
     )
     if ext_rc == 0 and ext_out.strip() == "true":
@@ -6702,6 +6747,10 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
             cwd=base, env=env, timeout=5,
         )
         if rc != 0:
+            if scope == "--worktree" and _worktree_probe_failure_is_empty_scope(
+                git_cmd, base, env
+            ):
+                continue
             return True
         for key in out.splitlines():
             if _GIT_FILTER_KEY_RE.match(key.strip()):
