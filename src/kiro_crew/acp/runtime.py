@@ -1951,7 +1951,10 @@ class AcpRuntime:
             self._scratch_dir = await self._to_thread_guarding_sandbox(
                 agent_scratch.allocate_scratch, "runtime"
             )
-        except OSError:
+        except (OSError, agent_scratch.ScratchBoundaryError):
+            # The boundary refusal joins OSError HERE and deliberately not at
+            # record_owner below: no child exists yet, so there is nothing to
+            # stop, and scratch is hygiene rather than a spawn prerequisite.
             logger.warning(
                 "agent-scratch: could not allocate; spawning with inherited temp",
                 exc_info=True,
@@ -2142,10 +2145,30 @@ class AcpRuntime:
                 # Liveness anchor for the scratch sweeps: a dir whose recorded
                 # owner is dead is reclaimable. Off-loop (file write), fail-open
                 # (an unowned dir falls under the grace-window rule instead).
-                await asyncio.get_running_loop().run_in_executor(
+                owner_outcome = await asyncio.get_running_loop().run_in_executor(
                     subprocess_executor(),
                     functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
                 )
+                if owner_outcome == "refused":
+                    # A LINK where this child's own marker belongs: the child
+                    # owns that directory and has pointed it somewhere else, so
+                    # it is steering an UNSANDBOXED gateway write at a path of
+                    # its choosing. Raising hands it to the guard below, which
+                    # reaps the process -- the spawn must not carry on as if the
+                    # owner had been recorded.
+                    raise agent_scratch.ScratchBoundaryError(
+                        "the spawned agent replaced its scratch owner marker with a link"
+                    )
+                if owner_outcome == "stale":
+                    # Not an attack: the update failed and the marker it left
+                    # could not be cleared, so this dir still names the GATEWAY.
+                    # That pid dies with the gateway while this child lives on,
+                    # which is the state a later sweep reads as a dead owner
+                    # before deleting a live agent's temp dir. Reaping now is
+                    # recoverable; that deletion is not.
+                    raise agent_scratch.ScratchBoundaryError(
+                        "the scratch owner marker still names the gateway after a failed update"
+                    )
         except BaseException:
             logger.error(
                 "AcpRuntime: spawn failed after the process was live (PID %s); reaping it "
