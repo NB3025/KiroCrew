@@ -15070,11 +15070,22 @@ async def _run_chat(
                         # replaced must not replay ahead of it. The model is already
                         # swapped and the notice already shown, which is harmless;
                         # we simply abandon the replay and let the turn end.
+                        # ``_stop_pressed()`` is the SINGLE live-Stop predicate for
+                        # this turn: it is True when a stop is in flight
+                        # (``slot._stopping``) OR the monotonic ``slot._stop_generation``
+                        # moved since turn entry. That one counter is sufficient for a
+                        # channel-linked slot too: every Stop — dashboard or
+                        # channel-born — enters through ``stop_slot_turn``, which sets
+                        # ``slot._stop_state`` (whose setter bumps ``_stop_generation``
+                        # on the idle→active edge) ON THE SLOT and only then routes the
+                        # cancel to the linked session key; the link changes which
+                        # session the cancel ADDRESSES, not which counter moves
+                        # (asserted by test_stop_addresses_linked_session.py). So there
+                        # is no session-scoped stop counter this guard could miss — the
+                        # slot counter is the one every Stop advances.
                         if (
                             not _should_suppress_requeue(slot)
-                            and not slot._stopping
-                            and getattr(slot, "_stop_generation", _stop_gen_turn_start)
-                            == _stop_gen_turn_start
+                            and not _stop_pressed()
                             and not bool(getattr(slot, "_pending_steers", None))
                             and not _has_user_queued_followup(slot)
                         ):
