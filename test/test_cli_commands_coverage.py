@@ -2198,7 +2198,7 @@ class TestLearnCli:
         with _LearnHarness() as h:
             h.vs.get_lessons.return_value = []
             h.jsonl.load_all.return_value = [
-                SimpleNamespace(category="tool", rule="r", negative="n")
+                SimpleNamespace(category="tool", rule="r", negative="n", repo_scope=None)
             ]
             cc._learn(_ns(learn_action="list"))
         assert "[tool] r — n" in capsys.readouterr().out
@@ -2212,7 +2212,7 @@ class TestLearnCli:
         with _LearnHarness() as h:
             h.vs.get_lessons.return_value = []
             h.jsonl.load_all.return_value = [
-                SimpleNamespace(category="", rule="legacy row", negative=None)
+                SimpleNamespace(category="", rule="legacy row", negative=None, repo_scope=None)
             ]
             cc._learn(_ns(learn_action="list"))
         out = capsys.readouterr().out

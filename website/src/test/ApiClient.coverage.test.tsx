@@ -163,6 +163,18 @@ describe('client transport', () => {
     await api.deleteLesson('never force push', null)
     expect(call(2).body).toEqual({ rule: 'never force push' })
     expect(call(2).body).not.toHaveProperty('repo_scope')
+    // The row's JSONL tier rides along when the list reported one, so the route
+    // deletes from the file the row was read from rather than its global default.
+    await api.deleteLesson('never force push', '', { scope: 'workspace', workspace: 'ws-1' })
+    expect(call(3).body).toEqual({ rule: 'never force push', repo_scope: '', scope: 'workspace', workspace: 'ws-1' })
+    await api.deleteLesson('never force push', '', { scope: undefined, workspace: undefined })
+    expect(call(4).body).toEqual({ rule: 'never force push', repo_scope: '' })
+    // `exact` is sent only when true: the route's default is the substring match
+    // the CLI relies on, and a table row that holds the whole rule opts out of it.
+    await api.deleteLesson('never force push', '', { exact: true })
+    expect(call(5).body).toEqual({ rule: 'never force push', repo_scope: '', exact: true })
+    await api.deleteLesson('never force push', '', { exact: false })
+    expect(call(6).body).not.toHaveProperty('exact')
   })
 
   it('POST omits the body entirely when none is given', async () => {

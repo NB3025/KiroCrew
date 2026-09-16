@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 
 from kiro_crew import model_registry
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.context import ContextBuilder
 from kiro_crew.cron import (
     CronPendingMismatch,
@@ -60,6 +60,7 @@ from kiro_crew.secrets import SecretVault
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
     _MODEL_NAME_RE,
+    ALLOWED_LESSON_SCOPES,
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
     CRON_ADD_SCHEMA,
@@ -67,6 +68,7 @@ from kiro_crew.validation import (
     MAX_CRON_MESSAGE,
     MAX_SHORT_STRING,
     SLACK_THREAD_TS_RE,
+    WORKSPACE_NAME_RE,
     FieldSpec,
     ValidationError,
     normalize_lesson_category,
@@ -88,7 +90,7 @@ from ._shared import (
 )
 
 if TYPE_CHECKING:
-    from kiro_crew.learn import LessonStore
+    from kiro_crew.learn import Lesson, LessonStore
 
 logger = logging.getLogger(__name__)
 
@@ -2586,6 +2588,67 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     if not rule_sub:
         return web.json_response({"error": "rule substring required"}, status=400)
     scope = body.get("scope", "global")
+    # The JSONL tier selector pair. ``scope`` picks the file and ``workspace``
+    # names it, so the two are validated together: a workspace-tier delete with
+    # no name would fall through to the ACTIVE workspace's file (or the global
+    # one) and remove a matching row the caller never pointed at, and a name
+    # without the tier would be silently ignored. Both are refused with 400.
+    # ``isinstance`` first: a non-string (a list, a dict) is unhashable, and the
+    # membership test alone would turn a malformed body into a 500.
+    if not isinstance(scope, str) or scope not in ALLOWED_LESSON_SCOPES:
+        return web.json_response(
+            {"error": "scope must be 'global' or 'workspace'", "code": "scope_not_allowed"},
+            status=400,
+        )
+    workspace = body.get("workspace")
+    if workspace is not None and (
+        not isinstance(workspace, str) or not WORKSPACE_NAME_RE.match(workspace)
+    ):
+        return web.json_response(
+            {"error": "workspace is not a valid workspace name", "code": "workspace_invalid"},
+            status=400,
+        )
+    if scope == "workspace" and not workspace:
+        return web.json_response(
+            {
+                "error": "scope='workspace' requires a workspace name",
+                "code": "workspace_required",
+            },
+            status=400,
+        )
+    # "default" is the reserved name of the GLOBAL file: ``_get_lessons`` maps it
+    # to ``state.lessons``, so accepting it under scope='workspace' would route a
+    # workspace-tier delete onto the global rows.
+    if scope == "workspace" and workspace == "default":
+        return web.json_response(
+            {
+                "error": "'default' is the global lessons file; use scope='global'",
+                "code": "workspace_reserved",
+            },
+            status=400,
+        )
+    # A name the configured workspace map does not hold is refused too:
+    # ``workspace_dir_for`` resolves an unmapped name to the DEFAULT workspace
+    # directory (logged, never raised), so a typo would land the delete on the
+    # default workspace's lessons file rather than on an empty one of its own.
+    if scope == "workspace":
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if workspace not in cfg.workspaces:
+            return web.json_response(
+                {
+                    "error": f"workspace '{workspace}' is not configured",
+                    "code": "workspace_unknown",
+                },
+                status=400,
+            )
+    if workspace and scope != "workspace":
+        return web.json_response(
+            {
+                "error": "workspace is only meaningful with scope='workspace'",
+                "code": "workspace_without_scope",
+            },
+            status=400,
+        )
     # Optional repo_scope discriminator. A lesson's identity is the pair
     # ``(rule, repo_scope)``: a scoped row and a same-rule global row are two
     # distinct lessons, and this selector decides which of them the delete
@@ -2624,6 +2687,17 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         )
     else:
         repo_scope = _rs
+    # Optional exact-match mode. The rule selector is a SUBSTRING by default --
+    # the CLI and MCP callers target a lesson by a fragment -- so a caller that
+    # holds the whole rule and means exactly that row (a table row's Delete
+    # button) says so, or "use tabs" would also take "always use tabs". Only a
+    # JSON boolean is accepted: a truthy string such as "false" must not turn
+    # exact on, and a falsy one must not silently widen the delete.
+    exact = body.get("exact", False)
+    if not isinstance(exact, bool):
+        return web.json_response(
+            {"error": "exact must be a boolean", "code": "exact_not_bool"}, status=400
+        )
     # Delete from vector store if active, else JSONL
     # THE CALLER'S silo, not the global store. This is the agent's only durable
     # memory-write surface, so writing globally let a crew bound to one silo steer
@@ -2648,14 +2722,14 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     # and the store is a real union now that it is resolved per caller instead of
     # arriving untyped from the global getter.
     if vs and vs_lessons:
-        ok = await asyncio.to_thread(vs.delete_lesson, rule_sub, repo_scope)
+        ok = await asyncio.to_thread(vs.delete_lesson, rule_sub, repo_scope, exact=exact)
     else:
-        store = _lesson_jsonl_store(state, _lesson_silo, scope, body.get("workspace"))
+        store = _lesson_jsonl_store(state, _lesson_silo, scope, workspace)
         # Off the loop. remove() now takes the store's shared lock, which a worker
         # thread can be holding across file I/O for a concurrent save_or_enrich --
         # so calling it inline would let one lessons write stall every task on the
         # event loop. Same reason api_lessons_create offloads its write.
-        ok = await asyncio.to_thread(store.remove, rule_sub, repo_scope)
+        ok = await asyncio.to_thread(store.remove, rule_sub, repo_scope, exact=exact)
     if ok:
         state.push_refresh("lessons")
     return web.json_response({"ok": ok})
@@ -2946,14 +3020,34 @@ def _lesson_scope_selector(stored: object) -> str | None:
     ``remove`` guards on ``is not None``; the vector store's
     ``_lesson_scope_unusable`` answers False for a null), and anything else is
     judged by :func:`scope_is_admissible`, the same predicate both stores use.
-    Not redacted: this value is a delete selector and must round-trip
-    byte-exact, and an admissible value is fragment-shaped by construction.
+
+    The selector must round-trip byte-exact to name its row, so it cannot be
+    rewritten -- but it is still a stored string leaving through this handler,
+    and every such string goes through the shared redaction chain. A fragment
+    the chain would alter carries a credential shape, and echoing it raw to
+    make the row selectable is the one trade this surface must not make: it is
+    withheld (``None``) instead, so the row reads as unusable and stays
+    reachable only through the unselective delete, exactly like a broken
+    scope. A fragment the chain leaves alone is emitted as-is.
     """
     if stored is None:
         return ""
     if not scope_is_admissible(stored):
         return None
-    return canonical_scope(stored)
+    selector = canonical_scope(stored)
+    if selector is None:
+        return None
+    # A control character (an escape sequence, a C0/C1 byte) inside the
+    # fragment is refused outright: the redaction chain scans the text as
+    # stored, so a credential split by an embedded escape would pass it whole
+    # and be reassembled by any terminal or renderer that strips the controls.
+    # Nothing a user names a repository by contains one, so withholding costs
+    # no real row.
+    if any(ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F for ch in selector):
+        return None
+    if _redact_memory_field(selector) != selector:
+        return None
+    return selector
 
 
 async def api_lessons(request: web.Request) -> web.Response:
@@ -2984,8 +3078,19 @@ async def api_lessons(request: web.Request) -> web.Response:
         ts: object,
         negative: object = None,
         repo_scope: object = None,
+        *,
+        tier: tuple[str, str | None] | None = None,
     ) -> dict:
         """One sanitization chokepoint for every branch of this endpoint.
+
+        *tier* names the JSONL file a row was read from -- ``("global", None)``
+        or ``("workspace", <name>)`` -- and is emitted as the ``scope`` /
+        ``workspace`` selectors ``DELETE /api/lessons`` uses to pick that file.
+        The JSONL list is a UNION of the global file and the active workspace's,
+        while the delete defaults to the global file, so a workspace row deleted
+        without its tier would leave the row and remove a same-text global one
+        instead. Vector rows pass no tier: the delete reaches the vector store
+        whatever ``scope`` says, so there is nothing to select.
 
         Lesson rows can carry consolidation (LLM) or import output: normalize
         the category through the shared helper (display policy, strict=False)
@@ -3007,6 +3112,10 @@ async def api_lessons(request: web.Request) -> web.Response:
             "ts": ts,
             "repo_scope": _lesson_scope_selector(repo_scope),
         }
+        if tier is not None:
+            result["scope"] = tier[0]
+            if tier[1] is not None:
+                result["workspace"] = tier[1]
         if contains_volatile_lesson_fact(rule, negative):
             result["withheld_reason"] = "volatile_session_fact"
         return result
@@ -3079,18 +3188,23 @@ async def api_lessons(request: web.Request) -> web.Response:
         # "here are the global ones". A silo also takes no workspace union: the two are
         # separate namespaces, so another target's rows are not this store's to show.
         rows = await asyncio.to_thread(lambda: _lesson_jsonl_store(state, _lesson_silo).load_all())
+        # Each row keeps the tier it came from, so its delete can be sent back
+        # to the same file (see ``_safe_lesson``).
+        tiered: list[tuple[Lesson, tuple[str, str | None]]] = [
+            (le, ("global", None)) for le in rows
+        ]
         if not _lesson_silo:
             # Merge global + workspace-scoped lessons
             ws = workspace or _get_active_workspace(state)
             if ws != "default":
+                # Every workspace row is listed, a same-text global row
+                # notwithstanding: the tier fields tell the two apart, and a row
+                # this list hides is a row the UI can never delete.
                 ws_lessons = await asyncio.to_thread(lambda: _get_lessons(state, ws).load_all())
-                seen = {le.rule.lower().strip() for le in rows}
-                for le in ws_lessons:
-                    if le.rule.lower().strip() not in seen:
-                        rows.append(le)
+                tiered.extend((le, ("workspace", ws)) for le in ws_lessons)
         data = [
-            _safe_lesson(le.rule, le.category, le.ts, le.negative, le.repo_scope)
-            for le in rows[-LESSON_LIST_LIMIT:]
+            _safe_lesson(le.rule, le.category, le.ts, le.negative, le.repo_scope, tier=tier)
+            for le, tier in tiered[-LESSON_LIST_LIMIT:]
         ]
     return web.json_response({"lessons": data})
 

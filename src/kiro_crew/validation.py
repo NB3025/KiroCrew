@@ -1147,6 +1147,14 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
         # gate could never satisfy (a bare "/", a dot segment) is refused here
         # so a delete cannot silently land on rows it never named.
         FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # The JSONL tier a listed row was read from. ``learn_list`` renders it
+        # because the list is a union of the global file and the active
+        # workspace's, while the delete route picks ONE file from these and
+        # defaults to the global one -- so a same-text workspace row could only
+        # ever be named by carrying its tier back. No default: an absent field
+        # keeps the route's own default rather than asserting one here.
+        FieldSpec("scope", str, allowed=ALLOWED_LESSON_SCOPES),
+        FieldSpec("workspace", str, max_len=MAX_SHORT_STRING, pattern=WORKSPACE_NAME_RE),
     ],
 )
 

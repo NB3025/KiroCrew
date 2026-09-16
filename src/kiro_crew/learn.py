@@ -378,12 +378,19 @@ class LessonStore:
         return outcome
 
     @named_store_operation
-    def remove(self, rule_substring: str, repo_scope: str | None = None) -> bool:
+    def remove(
+        self, rule_substring: str, repo_scope: str | None = None, *, exact: bool = False
+    ) -> bool:
         """Remove lessons whose rule contains *rule_substring*. Returns True if any removed.
 
         Substring matching on the rule text is deliberate: a user targets a
         lesson by a fragment of its rule rather than retyping the whole thing
         (``test_remove_matching`` deletes "Use tool-b" by passing "tool-b").
+        *exact* narrows the text match to the whole rule (case-insensitive,
+        surrounding whitespace ignored): a caller that holds the full rule -- a
+        table row's Delete button -- names ONE row, where the substring path would
+        also take every longer rule containing it ("use tabs" -> "always use
+        tabs"). The scope selector applies identically in both modes.
 
         A lesson's identity is the pair ``(rule, repo_scope)``: the same rule
         scoped to a repo and stored globally are two distinct rows, and the
@@ -414,6 +421,7 @@ class LessonStore:
         with self._lock:
             lessons = self.load_all()
             lower = rule_substring.lower()
+            wanted_text = lower.strip()
             # A missing selector leaves scope out of the match. A present one --
             # including the canonical form of an empty string, which is None and
             # targets the unscoped rows -- is compared canonically against each
@@ -423,7 +431,10 @@ class LessonStore:
             wanted_scope = canonical_scope(repo_scope) if scope_selective else None
 
             def _matches(le: Lesson) -> bool:
-                if lower not in le.rule.lower():
+                if exact:
+                    if le.rule.lower().strip() != wanted_text:
+                        return False
+                elif lower not in le.rule.lower():
                     return False
                 if scope_selective:
                     # A stored scope that is present but inadmissible (an

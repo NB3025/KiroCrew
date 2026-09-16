@@ -157,6 +157,26 @@ def schemas() -> list[dict[str, Any]]:
                             "remove only the unscoped (global) lessons."
                         ),
                     },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "workspace"],
+                        "description": (
+                            "Optional. Which lessons file to delete from, as "
+                            "learn_list reports it: a row shown with "
+                            "'(workspace: NAME)' lives in that workspace's file "
+                            "and is reached only with scope='workspace' plus "
+                            "workspace=NAME; every other row is in the global "
+                            "file, which is also the default."
+                        ),
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": (
+                            "Optional. The workspace name from the row's "
+                            "'(workspace: NAME)' marker; required with "
+                            "scope='workspace'."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -396,8 +416,39 @@ def learn_list(name: str, args: dict[str, Any]) -> str:
             if le.get("withheld_reason") == "volatile_session_fact"
             else ""
         )
-        lines.append(f"[{le.get('category', '?')}] {le['rule']}{withheld}")
+        lines.append(f"[{le.get('category', '?')}] {le['rule']}{withheld}{_scope_suffix(le)}")
     return "\n".join(lines)
+
+
+def _scope_suffix(row: dict[str, Any]) -> str:
+    """Render the row's ``repo_scope`` so same-rule rows in two scopes read apart.
+
+    A lesson's identity is ``(rule, repo_scope)``, and ``learn_remove`` below
+    takes that scope as its selector -- so a list that hid it showed two
+    distinct lessons as one duplicated line and gave the model nothing to pass.
+    Mirrors the route's per-row selector: a fragment names that scope, ``""``
+    is the global row (rendered bare, the common case), and ``null`` marks a
+    stored scope the store cannot use -- only the unselective remove reaches
+    such a row, which is worth saying where the model decides what to send.
+    An absent key (an older gateway) renders nothing.
+
+    The JSONL tier is the second half of the selector: the list is a union of
+    the global file and the active workspace's, and ``learn_remove`` defaults
+    to the global file, so a row read from a workspace file says so --
+    ``(workspace: NAME)`` -- and the model passes ``scope``/``workspace``
+    back. Global-file rows and vector rows render nothing for it.
+    """
+    parts = []
+    if "repo_scope" in row:
+        scope = row["repo_scope"]
+        if scope is None:
+            parts.append(" (scope: unusable)")
+        elif isinstance(scope, str) and scope:
+            parts.append(f" (scope: {scope})")
+    workspace = row.get("workspace")
+    if row.get("scope") == "workspace" and isinstance(workspace, str) and workspace:
+        parts.append(f" (workspace: {workspace})")
+    return "".join(parts)
 
 
 def learn_remove(name: str, args: dict[str, Any]) -> str:
@@ -414,6 +465,35 @@ def learn_remove(name: str, args: dict[str, Any]) -> str:
     rs = args.get("repo_scope")
     if isinstance(rs, str):
         payload["repo_scope"] = rs
+    # The JSONL tier, forwarded as ``learn_list`` reported it. The route picks
+    # the file from these and defaults to the global one, so a row listed with
+    # "(workspace: NAME)" is reachable only when both ride along; forwarded
+    # only when the caller named them, so an absent pair keeps today's default.
+    tier_scope = args.get("scope")
+    workspace = args.get("workspace")
+    # The pair is validated together before anything is sent: a workspace-tier
+    # delete with no name would land on whichever file the route picks by
+    # default, and a name without the tier would be ignored -- either way a
+    # row the caller never pointed at. Nothing is deleted on a refused pair.
+    if tier_scope == "workspace" and not workspace:
+        return (
+            "No lessons were removed: scope='workspace' needs the workspace name "
+            "from the row's '(workspace: NAME)' marker in learn_list."
+        )
+    if workspace and tier_scope != "workspace":
+        return (
+            "No lessons were removed: 'workspace' is only meaningful together with "
+            "scope='workspace'."
+        )
+    if tier_scope == "workspace" and workspace == "default":
+        return (
+            "No lessons were removed: 'default' is the global lessons file, which "
+            "learn_list shows without a '(workspace: ...)' marker; omit scope to "
+            "target it."
+        )
+    for key, value in (("scope", tier_scope), ("workspace", workspace)):
+        if isinstance(value, str) and value:
+            payload[key] = value
     d = mcp_core._delete("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:

@@ -5326,11 +5326,18 @@ class VectorMemoryStore:
         )
         return int(rows[0]["n"]) if rows else 0
 
-    def delete_lesson(self, rule_substring: str, repo_scope: str | None = None) -> bool:
+    def delete_lesson(
+        self, rule_substring: str, repo_scope: str | None = None, *, exact: bool = False
+    ) -> bool:
         """Delete lessons whose value contains rule_substring.
 
         Substring matching on the rule text is deliberate: a user targets a
         lesson by a fragment of its rule rather than retyping the whole thing.
+        *exact* narrows the text match to the whole rendered lesson text
+        (case-insensitive, surrounding whitespace ignored): a caller that holds
+        the full text -- a table row's Delete button -- names ONE row, where the
+        substring path would also take every longer rule containing it. The
+        scope selector applies identically in both modes.
         A lesson's identity is the pair ``(rule, repo_scope)`` -- the scope is
         folded into the semantic key so a scoped and a global lesson sharing
         rule text are two distinct rows, and the selector decides which of
@@ -5352,6 +5359,7 @@ class VectorMemoryStore:
         deleted = False
         scope_selective = repo_scope is not None
         wanted_scope = canonical_scope(repo_scope) if scope_selective else None
+        wanted_text = rule_substring.lower().strip()
         for e in self.get_lessons():
             val = json.loads(e["value_json"])
             # Match against the rendered lesson text so a mapping-shaped row is
@@ -5359,7 +5367,10 @@ class VectorMemoryStore:
             # substring like "category" delete every imported lesson). Rows with
             # no lesson shape fall back to str() so junk rows stay deletable.
             text = _lesson_display_text(val) or str(val)
-            if rule_substring.lower() not in text.lower():
+            if exact:
+                if text.lower().strip() != wanted_text:
+                    continue
+            elif rule_substring.lower() not in text.lower():
                 continue
             # ``_lesson_scope`` reads a mapping row's scope and normalises a legacy
             # string row (which cannot carry one) to None -- the same reader the
