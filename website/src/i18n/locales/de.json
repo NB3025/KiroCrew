@@ -5642,6 +5642,7 @@
       "reads_tooltip": "{{productName}} recherchiert selbst, fragt aber vor Änderungen nach",
       "trust_desc": "In diesem Chat arbeitet {{productName}}, ohne dich vorher zu fragen",
       "trust_label": "Vertrauen",
+      "chat_mode_hint": "Chatmodus",
       "trust_tooltip": "In diesem Chat arbeitet {{productName}}, ohne dich vorher zu fragen",
       "yolo_desc": "In jedem Chat arbeitet {{productName}}, ohne dich vorher zu fragen",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5733,6 +5734,9 @@
         "capability_backend": "Ein eigenes Programm auf diesem Computer im Hintergrund laufen lassen, solange {{productName}} geöffnet ist",
         "capability_shell": "Befehle auf diesem Computer ausführen, aus einer Liste, die die App mitliefert und die du nie gesehen hast",
         "capability_note": "Vertrauen gewährt alle drei Rechte, ob die App sie nutzt oder nicht. {{productName}} kann es nicht auf weniger beschränken.",
+        "session_approval_heading": "Diese App bittet außerdem darum, deine Chats zu steuern",
+        "session_approval_desc": "Nachrichten senden oder Antwortoptionen in deinen Chats auswählen, Tool-Anfragen genehmigen oder ablehnen und den Genehmigungsmodus eines Chats wechseln.",
+        "session_approval_modes": "Chat-Genehmigungsmodi, die sie setzen kann",
         "revocable": "Du kannst das jederzeit unter Einstellungen → Sicherheit → Vertrauenswürdige Apps von Drittanbietern zurücknehmen. Die App funktioniert danach nicht mehr.",
         "source": "Veröffentlicht unter",
         "not_reviewed": "{{productName}} listet diese App, hat ihren Code aber nicht geprüft, und der Name oben stammt von der App selbst.",
@@ -8828,6 +8832,9 @@
       "open_screenshot": "Screenshot {{n}} öffnen",
       "origin": "Ursprung:",
       "permissions": "Berechtigungen",
+      "session_approval_desc": "Kann Nachrichten senden und Antwortoptionen in deinen Chats auswählen, Tool-Anfragen genehmigen oder ablehnen und den Genehmigungsmodus eines Chats wechseln.",
+      "session_approval_modes": "Chat-Genehmigungsmodi, die sie setzen kann",
+      "session_approval_manifest_key": "Manifest-Schlüssel",
       "platform": "Plattform:",
       "previous": "Zurück",
       "removes_kirocrew_metadata_only_the_app_itself_is": "Entfernt nur die {{productName}}-Metadaten — die App selbst wird extern verwaltet",
@@ -8854,7 +8861,10 @@
       "websocket_events": "WebSocket-Ereignisse",
       "all_contributors": "Alle Mitwirkenden",
       "contributors": "Mitwirkende",
-      "retry": "Wiederholen"
+      "retry": "Wiederholen",
+      "enable_and_allow_chat_control": "Aktivieren und Chat-Steuerung erlauben",
+      "session_approval_confirm_title": "„{{name}}“ die Steuerung deiner Chats erlauben?",
+      "session_approval_reconsent_notice": "{{name}} ist deaktiviert, weil die App neu darum bittet, deine Chats zu steuern. Prüfe die Berechtigung auf dieser Seite, bevor du sie aktivierst."
     },
     "appPage": {
       "loading_app": "App wird geladen…",
@@ -8934,6 +8944,7 @@
       "installed_app_find_in_library_and_enable": "{{name}} installiert. Aktiviere die App in der Bibliothek.",
       "synced_from_its_source_directory": "{{name}} aus dem Quellverzeichnis synchronisiert.",
       "updated_from_the_registry": "{{name}} aus der Registry aktualisiert.",
+      "updated_needs_session_approval_consent": "{{name}} ist deaktiviert, weil die App neu darum bittet, deine Chats zu steuern. Prüfe die Berechtigung in den App-Details und aktiviere sie dann.",
       "refresh_store": "Store aktualisieren"
     },
     "artifactDeployPage": {

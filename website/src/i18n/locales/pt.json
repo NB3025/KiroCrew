@@ -5732,6 +5732,7 @@
       "reads_tooltip": "O {{productName}} pesquisa por conta própria, mas pergunta antes de fazer alterações",
       "trust_desc": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "trust_label": "Confiança",
+      "chat_mode_hint": "modo de chat",
       "trust_tooltip": "Neste chat, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_desc": "Em todos os chats, o {{productName}} trabalha sem perguntar primeiro",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5824,6 +5825,9 @@
         "capability_backend": "Manter um programa próprio rodando neste computador, em segundo plano, enquanto o {{productName}} estiver aberto",
         "capability_shell": "Executar comandos neste computador, a partir de uma lista que o app traz e que você nunca viu",
         "capability_note": "Confiar no app concede as três coisas, mesmo que ele não use todas. O {{productName}} não consegue conceder menos.",
+        "session_approval_heading": "Este app também pede para controlar seus chats",
+        "session_approval_desc": "Enviar mensagens ou escolher opções de resposta nos seus chats, aprovar ou negar solicitações de ferramentas e trocar o modo de aprovação de um chat.",
+        "session_approval_modes": "Modos de aprovação do chat que ele pode definir",
         "revocable": "Você pode desfazer isso quando quiser em Configurações → Segurança → Apps de terceiros confiáveis. O app para de funcionar quando você fizer isso.",
         "source": "Publicado em",
         "not_reviewed": "O {{productName}} lista este app, mas não revisou o código dele, e o nome acima vem do próprio app.",
@@ -8945,6 +8949,9 @@
       "open_screenshot": "Abrir a captura de tela {{n}}",
       "origin": "Origem:",
       "permissions": "Permissões",
+      "session_approval_desc": "Pode enviar mensagens e escolher opções de resposta nos seus chats, aprovar ou negar solicitações de ferramentas e trocar o modo de aprovação de um chat.",
+      "session_approval_modes": "Modos de aprovação do chat que ele pode definir",
+      "session_approval_manifest_key": "Chave do manifesto",
       "platform": "Plataforma:",
       "previous": "Anterior",
       "removes_kirocrew_metadata_only_the_app_itself_is": "Remove apenas os metadados do {{productName}} — o app em si é gerenciado externamente",
@@ -8971,7 +8978,10 @@
       "websocket_events": "Eventos WebSocket",
       "all_contributors": "Todos os contribuidores",
       "contributors": "Contribuidores",
-      "retry": "Tentar novamente"
+      "retry": "Tentar novamente",
+      "enable_and_allow_chat_control": "Ativar e permitir o controle dos chats",
+      "session_approval_confirm_title": "Permitir que “{{name}}” controle seus chats?",
+      "session_approval_reconsent_notice": "{{name}} está desativado porque passou a pedir para controlar seus chats. Revise a permissão nesta página antes de ativá-lo."
     },
     "appPage": {
       "loading_app": "Carregando app…",
@@ -9059,6 +9069,7 @@
       "installed_app_find_in_library_and_enable": "{{name}} instalado. Ative-o na Biblioteca.",
       "synced_from_its_source_directory": "{{name}} sincronizado a partir do diretório de origem.",
       "updated_from_the_registry": "{{name}} atualizado a partir do registro.",
+      "updated_needs_session_approval_consent": "{{name}} está desativado porque passou a pedir para controlar seus chats. Revise a permissão nos detalhes do app e ative-o.",
       "refresh_store": "Atualizar a loja"
     },
     "artifactDeployPage": {

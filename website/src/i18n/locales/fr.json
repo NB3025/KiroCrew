@@ -5732,6 +5732,7 @@
       "reads_tooltip": "{{productName}} se documente tout seul, mais demande avant de faire des modifications",
       "trust_desc": "Dans ce chat, {{productName}} travaille sans vous demander d'abord",
       "trust_label": "Confiance",
+      "chat_mode_hint": "mode de chat",
       "trust_tooltip": "Dans ce chat, {{productName}} travaille sans vous demander d'abord",
       "yolo_desc": "Dans chaque chat, {{productName}} travaille sans vous demander d'abord",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
@@ -5824,6 +5825,9 @@
         "capability_backend": "Faire tourner son propre programme en arrière-plan sur cet ordinateur, tant que {{productName}} est ouvert",
         "capability_shell": "Exécuter des commandes sur cet ordinateur, à partir d'une liste fournie par l'application et que tu n'as jamais vue",
         "capability_note": "Faire confiance à l'application accorde les trois, qu'elle les utilise ou non. {{productName}} ne peut pas lui en accorder moins.",
+        "session_approval_heading": "Cette application demande aussi à contrôler tes chats",
+        "session_approval_desc": "Envoyer des messages ou choisir des options de réponse dans tes chats, approuver ou refuser les demandes d'outils et changer le mode d'approbation d'un chat.",
+        "session_approval_modes": "Modes d'approbation du chat qu'elle peut définir",
         "revocable": "Tu peux revenir sur ce choix à tout moment dans Paramètres → Sécurité → Applications tierces de confiance. L'application cesse alors de fonctionner.",
         "source": "Publié sur",
         "not_reviewed": "{{productName}} référence cette application mais n'a pas examiné son code, et le nom ci-dessus vient de l'application elle-même.",
@@ -8945,6 +8949,9 @@
       "open_screenshot": "Ouvrir la capture d’écran {{n}}",
       "origin": "Origine :",
       "permissions": "Autorisations",
+      "session_approval_desc": "Peut envoyer des messages et choisir des options de réponse dans tes chats, approuver ou refuser les demandes d'outils et changer le mode d'approbation d'un chat.",
+      "session_approval_modes": "Modes d'approbation du chat qu'elle peut définir",
+      "session_approval_manifest_key": "Clé du manifeste",
       "platform": "Plateforme :",
       "previous": "Précédent",
       "removes_kirocrew_metadata_only_the_app_itself_is": "Supprime uniquement les métadonnées {{productName}} — l'application elle-même est gérée en externe",
@@ -8971,7 +8978,10 @@
       "websocket_events": "Événements WebSocket",
       "all_contributors": "Tous les contributeurs",
       "contributors": "Contributeurs",
-      "retry": "Réessayer"
+      "retry": "Réessayer",
+      "enable_and_allow_chat_control": "Activer et autoriser le contrôle des chats",
+      "session_approval_confirm_title": "Autoriser « {{name}} » à contrôler tes chats ?",
+      "session_approval_reconsent_notice": "{{name}} est désactivée, car elle demande maintenant à contrôler tes chats. Vérifie l’autorisation sur cette page avant de l’activer."
     },
     "appPage": {
       "loading_app": "Chargement de l'application…",
@@ -9059,6 +9069,7 @@
       "installed_app_find_in_library_and_enable": "{{name}} installé. Activez-le dans la Bibliothèque.",
       "synced_from_its_source_directory": "{{name}} synchronisée depuis son répertoire source.",
       "updated_from_the_registry": "{{name}} mise à jour depuis le registre.",
+      "updated_needs_session_approval_consent": "{{name}} est désactivée, car elle demande maintenant à contrôler tes chats. Vérifie l’autorisation dans les détails de l’application, puis active-la.",
       "refresh_store": "Actualiser la boutique"
     },
     "artifactDeployPage": {

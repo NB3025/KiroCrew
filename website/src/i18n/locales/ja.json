@@ -5534,6 +5534,7 @@
       "reads_tooltip": "{{productName}} は独力で検索しますが、変更する前に確認します",
       "trust_desc": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "trust_label": "信頼",
+      "chat_mode_hint": "チャットモード",
       "trust_tooltip": "このチャットでは、{{productName}} は最初に確認せずに機能します",
       "yolo_desc": "すべてのチャットで、{{productName}} は最初に確認せずに機能します",
       "yolo_expiration_timed": "{{duration}} 後に自動的にオフになり、その後再び確認します。",
@@ -5624,6 +5625,9 @@
         "capability_backend": "{{productName}} が開いている間、このコンピューターのバックグラウンドで独自のプログラムを実行し続けます",
         "capability_shell": "アプリに同梱された、あなたがまだ見ていない一覧から、このコンピューターでコマンドを実行します",
         "capability_note": "アプリを信頼すると、実際にすべてを使うかどうかにかかわらず3つすべてが許可されます。{{productName}} はこれより狭く制限できません。",
+        "session_approval_heading": "このアプリはチャットの制御も要求しています",
+        "session_approval_desc": "あなたのチャットでメッセージを送信するか返信オプションを選び、ツール要求を承認または拒否し、チャットの承認モードを切り替えること。",
+        "session_approval_modes": "設定できるチャットの承認モード",
         "revocable": "設定 → セキュリティ → 信頼済みサードパーティーアプリで、いつでも取り消せます。取り消すとそのアプリは動作を停止します。",
         "source": "公開元",
         "not_reviewed": "{{productName}} はこのアプリを掲載していますが、そのコードをレビューしていません。上記の名前もアプリ自身が申告したものです。",
@@ -8711,6 +8715,9 @@
       "open_screenshot": "スクリーンショット {{n}} を開く",
       "origin": "起源:",
       "permissions": "権限",
+      "session_approval_desc": "あなたのチャットでメッセージを送信して返信オプションを選び、ツール要求を承認または拒否し、チャットの承認モードを切り替えられます。",
+      "session_approval_modes": "設定できるチャットの承認モード",
+      "session_approval_manifest_key": "マニフェストキー",
       "platform": "プラットフォーム:",
       "previous": "前へ",
       "removes_kirocrew_metadata_only_the_app_itself_is": "{{productName}} メタデータのみを削除します — アプリ自体は外部で管理されます",
@@ -8737,7 +8744,10 @@
       "websocket_events": "WebSocket イベント",
       "all_contributors": "すべての貢献者",
       "contributors": "貢献者",
-      "retry": "再試行"
+      "retry": "再試行",
+      "enable_and_allow_chat_control": "有効にしてチャット操作を許可",
+      "session_approval_confirm_title": "「{{name}}」にチャットの操作を許可しますか？",
+      "session_approval_reconsent_notice": "{{name}} は新たにチャットの制御を要求するため、無効になっています。有効にする前に、このページで権限を確認してください。"
     },
     "appPage": {
       "loading_app": "アプリを読み込み中…",
@@ -8809,6 +8819,7 @@
       "synced_from_its_source_directory": "{{name}} をソースディレクトリから同期しました。",
       "updated_app_other": "{{count}} アプリを更新しました。",
       "updated_from_the_registry": "{{name}} をレジストリから更新しました。",
+      "updated_needs_session_approval_consent": "{{name}} は新たにチャットの制御を要求するため、無効になっています。アプリの詳細で権限を確認し、有効にしてください。",
       "refresh_store": "ストアを更新"
     },
     "artifactDeployPage": {
