@@ -6213,15 +6213,21 @@ def _switch_target_busy(
       caller-side guards defend against test doubles that are not
       ``LLMProvider`` instances, and the base default is False so no real
       provider is missed.
-    * ``state.running_session_keys()`` -- the effective-session-key set of
-      every slot whose ``task`` is live. Two alias slots can drive ONE
-      session (a channel-linked slot and its dashboard twin), and a switch
-      issued through alias A while alias B is cold-starting sees neither of
-      the first two signals: A's ``running`` is False and B's provider is
-      not registered yet. Without this set the switch commits, resets
-      nothing, and reports success while the session comes up on B's
-      captured (old) bindings -- the header advertises one agent/model/
-      workspace and the live process runs another.
+    * every OTHER running slot's turn key -- ``_cancel_target`` of each
+      slot whose ``task`` is live: the identity its in-flight turn published
+      (``_active_turn_session_key``), falling back to its routing when the
+      turn has not published yet. Two alias slots can drive ONE session (a
+      channel-linked slot and its dashboard twin), and a switch issued
+      through alias A while alias B is cold-starting sees neither of the
+      first two signals: A's ``running`` is False and B's provider is not
+      registered yet. Without this scan the switch commits, resets nothing,
+      and reports success while the session comes up on B's captured (old)
+      bindings -- the header advertises one agent/model/workspace and the
+      live process runs another. The TURN key, not the routing: a rebind
+      landing on B mid-turn (a cron injection takes no ``running`` gate)
+      moves B's routing off the shared session while its turn still runs
+      there, and a scan of routings would drop B from the set exactly when
+      its turn is what the reset would tear down.
 
     Call it INSIDE the switch locks, with the *session_key* resolved there
     (the value the probe and the reset act on). Callers keep the atomic
@@ -6233,7 +6239,12 @@ def _switch_target_busy(
         return True
     if isinstance(provider, LLMProvider) and provider.has_active_turn():
         return True
-    return session_key in state.running_session_keys()
+    # list(): the scan is read-only and message dispatch may register a slot
+    # while it runs (the same snapshot every other slot-table scan takes).
+    return any(
+        other.running and _cancel_target(other) == session_key
+        for other in list(state._slots.values())
+    )
 
 
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
@@ -6613,19 +6624,6 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 status=409,
             )
 
-        # Last-instant re-probe in a NO-AWAIT window before the teardown (the
-        # model template's rule at its own reset site): the pre-commit check
-        # above is separated from this point by the resolution warm-up await,
-        # so a turn — a channel message on the linked session in particular —
-        # may have started since it ran. Message dispatch does not take
-        # slot._lock, so this fast path plus the atomic skip_if_busy decline
-        # below are what keep the teardown off a streaming turn.
-        recheck = state.sessions.get_provider(session_key)
-        if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
-            _rollback_switch()
-            return web.json_response(
-                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
-            )
         # Children guard, shared with reload/model: the reset tears down the
         # runtime attached sub-agents run on, so a parent that is idle but
         # still has children must refuse rather than discard their work.
@@ -6633,6 +6631,22 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         if children_409 is not None:
             _rollback_switch()
             return children_409
+        # Last-instant re-probe in a NO-AWAIT window before the teardown (the
+        # model template's rule at its own reset site): the pre-commit check
+        # above is separated from this point by the resolution warm-up and
+        # the children probe awaits, so a turn — a channel message on the
+        # linked session, or a sibling alias cold-starting on it — may have
+        # started since it ran. Same predicate as the pre-commit check
+        # (_switch_target_busy), so the sibling window it closes there is
+        # closed here too. Message dispatch does not take slot._lock, so this
+        # fast path plus the atomic skip_if_busy decline below are what keep
+        # the teardown off a streaming turn.
+        recheck = state.sessions.get_provider(session_key)
+        if _switch_target_busy(state, slot, session_key, recheck):
+            _rollback_switch()
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
         teardown_incomplete = False
         reset_ok = True
         # The switch is COMMITTED already (slot.agent above), so a POST-POP
@@ -7360,8 +7374,24 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # entering it busy would falsely reject that turn's cards even
             # though the reset itself declines. Busy here → roll back and
             # answer the same 409 the pre-check gives.
+            # Children guard, shared with reload/continue: the reset tears
+            # down the runtime attached sub-agents run on, so a parent that is
+            # idle but still has children (running, queued, or with a
+            # completion event in flight) must refuse rather than discard
+            # their work. Same probe block as api_chat_slot_reload; only the
+            # rollback is added here because this handler committed first.
+            children_409 = await _subagents_attached_response(
+                state, slot, session_key, "slot_model"
+            )
+            if children_409 is not None:
+                _rollback_pick()
+                return children_409
+            # Probed AFTER the children await, so this is the NO-AWAIT window
+            # the reset needs; same predicate as the pre-check
+            # (_switch_target_busy), so a sibling alias that began
+            # cold-starting during either await is refused here too.
             recheck = state.sessions.get_provider(session_key)
-            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+            if _switch_target_busy(state, slot, session_key, recheck):
                 if _live_serves_target(recheck):
                     # The turn that slipped in runs on a session that already
                     # serves the target (set_model landed before the effort
@@ -7382,18 +7412,6 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
                 )
-            # Children guard, shared with reload/continue: the reset tears
-            # down the runtime attached sub-agents run on, so a parent that is
-            # idle but still has children (running, queued, or with a
-            # completion event in flight) must refuse rather than discard
-            # their work. Same probe block as api_chat_slot_reload; only the
-            # rollback is added here because this handler committed first.
-            children_409 = await _subagents_attached_response(
-                state, slot, session_key, "slot_model"
-            )
-            if children_409 is not None:
-                _rollback_pick()
-                return children_409
             logger.info(
                 "Slot %s model switched to %r, resetting session", name, model_name or "auto"
             )
@@ -7872,28 +7890,30 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             if slot.model == model_name:
                 unchanged.append(name)
                 continue
-            # Busy check on the EFFECTIVE session, same predicate as the
-            # single-slot handler (_switch_target_busy): slot.running only
-            # sees turns dispatched through this slot's task; a
-            # channel-linked slot's turn runs under its linked key without
-            # setting it, and a sibling alias cold-starting on the shared
-            # session has set neither. _reset_slot_session clears pending
-            # waits BEFORE its atomic decline (its docstring's safety
-            # argument assumes a caller-side busy check microseconds old), so
-            # entering it against a live linked turn would reject that turn's
-            # cards even though the reset itself declines. Gated on
-            # skip_running like the atomic decline below: a caller that asked
-            # to switch running slots gets the reset regardless.
-            live_now = state.sessions.get_provider(session_key)
-            if skip_running and _switch_target_busy(state, slot, session_key, live_now):
-                skipped_running.append(name)
-                continue
             # Children guard (api_chat_slot_reload's): the reset tears down the
             # runtime attached sub-agents run on, so a parent with children
             # running, queued, or mid-delivery is skipped rather than have
             # their work discarded — regardless of skip_running, which speaks
             # to the parent's own turn, not to its children.
             if await subagents_attached_async(state, slot, session_key, "slots_model"):
+                skipped_running.append(name)
+                continue
+            # Busy check on the EFFECTIVE session, same predicate as the
+            # single-slot handler (_switch_target_busy): slot.running only
+            # sees turns dispatched through this slot's task; a
+            # channel-linked slot's turn runs under its linked key without
+            # setting it, and a sibling alias cold-starting on the shared
+            # session has set neither. Probed AFTER the children await: the
+            # reset below is the next thing this iteration does, so this is
+            # the no-await window. _reset_slot_session clears pending waits
+            # BEFORE its atomic decline (its docstring's safety argument
+            # assumes a caller-side busy check microseconds old), so entering
+            # it against a live linked turn would reject that turn's cards
+            # even though the reset itself declines. Gated on skip_running
+            # like the atomic decline below: a caller that asked to switch
+            # running slots gets the reset regardless.
+            live_now = state.sessions.get_provider(session_key)
+            if skip_running and _switch_target_busy(state, slot, session_key, live_now):
                 skipped_running.append(name)
                 continue
             # Reset before flipping the model and isolate per-slot failures: if
@@ -8154,17 +8174,6 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # Never tear down an in-flight turn (the model handler's policy,
             # and the _cancel_target subtlety: a RUNNING turn owns a captured
             # identity, so the key resolved above may not be the turn's).
-            # Probed here because the change_effort awaits above yielded the
-            # event loop; the signals and the sibling-alias window are on
-            # _switch_target_busy. The effort-capable live provider's active
-            # turn never reaches this — the defer branch above already
-            # returned for it. A 409 is retryable once the turn completes;
-            # nothing is committed yet.
-            recheck = state.sessions.get_provider(session_key)
-            if _switch_target_busy(state, slot, session_key, recheck):
-                return web.json_response(
-                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
-                )
             # Children guard, shared with reload/model: the reset tears down
             # the runtime attached sub-agents run on. Nothing is committed
             # yet, so a refusal here changes nothing.
@@ -8173,6 +8182,17 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             )
             if children_409 is not None:
                 return children_409
+            # Probed AFTER the change_effort and children awaits above, in
+            # the NO-AWAIT window before the commit and reset below; the
+            # signals and the sibling-alias window are on _switch_target_busy.
+            # The effort-capable live provider's active turn never reaches
+            # this — the defer branch above already returned for it. A 409 is
+            # retryable once the turn completes; nothing is committed yet.
+            recheck = state.sessions.get_provider(session_key)
+            if _switch_target_busy(state, slot, session_key, recheck):
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
             # No live session (or live update failed): reset so the next cold
             # start picks up the new effort via the provider factory/overlay.
             # The effort is committed BEFORE the reset: a message send landing

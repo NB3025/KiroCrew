@@ -9,13 +9,14 @@ multi-second ``provider.start()`` registers a session. Without a third signal
 the switch commits, resets nothing, and reports success while the session
 comes up on B's captured (old) bindings.
 
-``DashboardState.running_session_keys()`` is the effective-session-key set of
-every slot whose task is live, so it sees B's cold start under the shared key.
-These tests model exactly that window -- B's ``task`` set, no registered
-provider -- and drive it through each of the five switch handlers via A. Each
-must refuse (409 ``turn_in_flight``; the bulk handler lists A in
-``skipped_running``), never await the reset, and leave A's bindings untouched.
-Control cases assert the same switch proceeds once B's turn is done.
+The third signal scans every running slot's TURN key (``_cancel_target``: the
+identity its in-flight turn published, else its routing), so it sees B's cold
+start under the shared key -- and keeps seeing it after a mid-turn rebind moves
+B's routing elsewhere. These tests model exactly that window -- B's ``task``
+set, no registered provider -- and drive it through each of the five switch
+handlers via A. Each must refuse (409 ``turn_in_flight``; the bulk handler
+lists A in ``skipped_running``), never await the reset, and leave A's bindings
+untouched. Control cases assert the same switch proceeds once B's turn is done.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-from types import MethodType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -87,9 +87,6 @@ def _mock_state(*slots: _ChatSlot) -> DashboardState:
     # No transcript store: the control cases run the commit path to its 200,
     # and the metadata persist is skipped when there is nothing to write to.
     state.conversation_log = None
-    # The real predicate over the mock's slot table, so the test proves the
-    # handlers consult it rather than a stub that answers what we want.
-    state.running_session_keys = MethodType(DashboardState.running_session_keys, state)
     return state
 
 
@@ -233,3 +230,140 @@ class TestBulkModelSwitchSkipsASiblingColdStart:
             payload = await resp.json()
         assert _ALIAS_A in payload["switched"]
         assert alias_a.model == _MODEL_NEW
+
+
+class TestSiblingColdStartDuringTheLastAwait:
+    """The sibling's task appears AFTER the pre-commit check, during the last await before reset.
+
+    The pre-commit check runs before the handler's remaining awaits (the
+    agent's resolution warm-up, the model's live-switch RPCs, and every
+    handler's children probe). A sibling alias that begins cold-starting
+    during one of those is invisible to a check that already ran, so each
+    handler re-probes the same predicate in the no-await window right before
+    its reset -- and, where it has already committed, unwinds the commit.
+    The children probe is the last await they all share, so the sibling's
+    task is started from inside it.
+    """
+
+    @staticmethod
+    def _start_sibling_inside_children_probe(
+        monkeypatch: pytest.MonkeyPatch, alias_b: _ChatSlot, gate: asyncio.Event
+    ) -> None:
+        async def _probe_then_cold_start(*_args, **_kwargs) -> bool:
+            async def _cold_start() -> None:
+                await gate.wait()
+
+            if alias_b.task is None:
+                alias_b.task = asyncio.create_task(_cold_start())
+            await asyncio.sleep(0)
+            return False
+
+        monkeypatch.setattr(chat_handlers, "subagents_attached_async", _probe_then_cold_start)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("route", "body", "field", "old_value"),
+        # Workspace is not listed: its check already sits after its last await
+        # (the children probe precedes it), so this window does not exist there.
+        [p for p in _SINGLE_SLOT_SWITCHES if p.id != "workspace"],
+    )
+    async def test_refuses_and_restores_when_sibling_appears_before_reset(
+        self, state, alias_a, alias_b, monkeypatch, route, body, field, old_value
+    ):
+        gate = asyncio.Event()
+        self._start_sibling_inside_children_probe(monkeypatch, alias_b, gate)
+        try:
+            assert not alias_b.running, "B must be idle when the pre-commit check runs"
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(route, json=body)
+                assert resp.status == 409, await resp.text()
+                payload = await resp.json()
+            assert payload["code"] == "turn_in_flight"
+            assert alias_b.running, "the probe stub did not start the sibling"
+            state.sessions.reset.assert_not_awaited()
+            assert getattr(alias_a, field) == old_value
+        finally:
+            gate.set()
+            if alias_b.task is not None:
+                await asyncio.gather(alias_b.task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_bulk_skips_when_sibling_appears_before_reset(
+        self, state, alias_a, alias_b, monkeypatch
+    ):
+        gate = asyncio.Event()
+        self._start_sibling_inside_children_probe(monkeypatch, alias_b, gate)
+        try:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post("/api/chat/slots/model", json={"model": _MODEL_NEW})
+                assert resp.status == 200, await resp.text()
+                payload = await resp.json()
+            assert _ALIAS_A in payload["skipped_running"]
+            assert _ALIAS_A not in payload["switched"]
+            state.sessions.reset.assert_not_awaited()
+            assert alias_a.model == _MODEL_OLD
+        finally:
+            gate.set()
+            if alias_b.task is not None:
+                await asyncio.gather(alias_b.task, return_exceptions=True)
+
+
+class TestSiblingRebindsAfterPublishingItsTurnKey:
+    """B's routing moves off the shared session mid-turn; its TURN still runs there.
+
+    A cron injection rebinds ``linked_session_key`` on a live slot with no
+    ``running`` gate. B's cold-starting turn published the shared key as its
+    identity before the rebind, and that turn -- not B's new routing -- is what
+    a reset of the shared session would tear down. A busy scan keyed on each
+    running slot's routing drops B the moment it rebinds; the scan must follow
+    the published turn key instead.
+    """
+
+    @staticmethod
+    def _rebind_after_publish(alias_b: _ChatSlot) -> None:
+        alias_b._active_turn_session_key = _SHARED_SESSION_KEY
+        alias_b.linked_session_key = "cron:job-elsewhere"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("route", "body", "field", "old_value"), _SINGLE_SLOT_SWITCHES)
+    async def test_refuses_when_sibling_rebound_but_its_turn_runs_here(
+        self, state, alias_a, alias_b, route, body, field, old_value
+    ):
+        async with _sibling_cold_start(alias_b):
+            self._rebind_after_publish(alias_b)
+            assert chat_handlers.effective_session_key(alias_b) != _SHARED_SESSION_KEY
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(route, json=body)
+                assert resp.status == 409, await resp.text()
+                payload = await resp.json()
+        assert payload["code"] == "turn_in_flight"
+        state.sessions.reset.assert_not_awaited()
+        assert getattr(alias_a, field) == old_value
+
+    @pytest.mark.asyncio
+    async def test_bulk_skips_when_sibling_rebound_but_its_turn_runs_here(
+        self, state, alias_a, alias_b
+    ):
+        async with _sibling_cold_start(alias_b):
+            self._rebind_after_publish(alias_b)
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post("/api/chat/slots/model", json={"model": _MODEL_NEW})
+                assert resp.status == 200, await resp.text()
+                payload = await resp.json()
+        assert _ALIAS_A in payload["skipped_running"]
+        assert _ALIAS_A not in payload["switched"]
+        assert alias_a.model == _MODEL_OLD
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("route", "body", "field", "old_value"), _SINGLE_SLOT_SWITCHES)
+    async def test_proceeds_when_sibling_turn_runs_elsewhere(
+        self, state, alias_a, alias_b, route, body, field, old_value
+    ):
+        """Control: B's turn published a DIFFERENT key, so the shared session is not busy."""
+        async with _sibling_cold_start(alias_b):
+            alias_b._active_turn_session_key = "cron:job-elsewhere"
+            alias_b.linked_session_key = "cron:job-elsewhere"
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(route, json=body)
+                assert resp.status == 200, await resp.text()
+        assert getattr(alias_a, field) != old_value
