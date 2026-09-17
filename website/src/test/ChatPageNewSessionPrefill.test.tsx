@@ -22,11 +22,11 @@ import type { ReactNode } from 'react'
 import { render, act, waitFor, screen } from '@testing-library/react'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer from '../store/chatSlice'
+import chatReducer, { switchSlot } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { PREFILL_STORAGE_KEY } from '../utils/navIntent'
@@ -38,10 +38,11 @@ vi.mock('react-virtuoso', () => ({
 }))
 const createChatSlot = vi.fn()
 const sendChat = vi.fn()
+const chatSlotDetail = vi.fn()
 vi.mock('../api/client', () => ({
   api: {
     chatSlots: vi.fn().mockResolvedValue([]),
-    chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 }),
+    chatSlotDetail: (...a: unknown[]) => chatSlotDetail(...a),
     sendChat: (...a: unknown[]) => sendChat(...a),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
     models: vi.fn().mockResolvedValue([]),
@@ -91,13 +92,14 @@ function makeStore() {
       dashboard: {
         status: null, connected: true, slotsLoaded: true,
         slots: [
+          { key: 'chat-other', messages: 2, running: false, mode: '', pending_approval: false, waiting_for_input: false },
           { key: 'chat-old', messages: 3, running: false, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined },
         ],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
       } as unknown as RootState['dashboard'],
       chat: {
-        activeSlot: null, messages: [],
+        activeSlot: null, messages: [], switchSlotGone: null,
         slotRunning: false, slotStopping: false, slotState: 'idle',
         history: [], historyHasMore: false, pendingInput: null,
         subagents: {}, toolLog: [], activityOpen: false, activityTab: 'tools',
@@ -111,6 +113,14 @@ function makeStore() {
   })
 }
 
+let navigateInTest: ReturnType<typeof useNavigate>
+let locationInTest: ReturnType<typeof useLocation>
+function NavigationProbe() {
+  navigateInTest = useNavigate()
+  locationInTest = useLocation()
+  return null
+}
+
 async function renderAt(route: string) {
   const store = makeStore()
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
@@ -119,7 +129,7 @@ async function renderAt(route: string) {
       <QueryClientProvider client={qc}>
         <Provider store={store}>
           <ThemeProvider>
-            <MemoryRouter initialEntries={[route]}><ChatPage /></MemoryRouter>
+            <MemoryRouter initialEntries={[route]}><NavigationProbe /><ChatPage /></MemoryRouter>
           </ThemeProvider>
         </Provider>
       </QueryClientProvider>,
@@ -131,9 +141,12 @@ async function renderAt(route: string) {
 const composer = () => screen.getByLabelText('Message input') as HTMLTextAreaElement
 
 beforeEach(() => {
+  delete (window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch
   sessionStorage.clear()
   localStorage.clear()
   createChatSlot.mockReset()
+  chatSlotDetail.mockReset()
+  chatSlotDetail.mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 })
   sendChat.mockReset()
   sendChat.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) })
   createChatSlot.mockResolvedValue({ key: NEW_SLOT, title: NEW_SLOT, messages: 0, running: false })
@@ -180,5 +193,168 @@ describe('ChatPage — /chat?new=1&prefill= seeds a fresh session', { timeout: 2
     await waitFor(() => expect(screen.getByLabelText('Message input')).toBeTruthy())
     expect(createChatSlot).not.toHaveBeenCalled()
     expect(composer().value).toBe('')
+  })
+})
+
+
+describe('App SDK chat launch intent', () => {
+  function launch(options: { message: string; slotKey?: string; autoSend?: boolean; agent?: string }) {
+    ;(window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch = { ...options, ts: Date.now() }
+  }
+
+  it('seeds an existing slot without sending or creating a replacement', async () => {
+    launch({ message: PROMPT, slotKey: 'chat-old', autoSend: false })
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-old'))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('creates a fresh draft without spending a model turn', async () => {
+    launch({ message: PROMPT, autoSend: false })
+    const store = await renderAt('/chat?new=1')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    expect(sendChat).not.toHaveBeenCalled()
+  })
+
+  it('sends to the explicitly selected existing slot, not a new session', async () => {
+    launch({ message: PROMPT, slotKey: 'chat-old' })
+    await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(sendChat.mock.calls[0]).toContain('chat-old')
+    expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('handles a fresh draft launch while ChatPage is already mounted', async () => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-old'))
+    launch({ message: PROMPT, autoSend: false, agent: 'example-agent' })
+    await act(async () => { navigateInTest('/chat?new=1') })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    expect(createChatSlot.mock.calls[0]).toContain('example-agent')
+    expect(sendChat).not.toHaveBeenCalled()
+  })
+
+  it.each([true, false])('activates another slot on a hot launch (autoSend=%s)', async (autoSend) => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    expect(store.getState().chat.activeSlot).toBe('chat-old')
+    chatSlotDetail.mockClear()
+    launch({ message: PROMPT, slotKey: 'chat-other', autoSend })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-other'))
+    if (autoSend) {
+      await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+      expect(sendChat.mock.calls[0]).toContain('chat-other')
+    } else {
+      await waitFor(() => expect(composer().value).toBe(PROMPT))
+      expect(sendChat).not.toHaveBeenCalled()
+    }
+    expect(chatSlotDetail).toHaveBeenCalledTimes(1)
+    expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('keeps a claimed target message while activation outlasts the launch TTL', async () => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    let finish!: (value: unknown) => void
+    chatSlotDetail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const now = Date.now()
+    launch({ message: PROMPT, slotKey: 'chat-other' })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    expect(store.getState().chat.slotLoading).toBe(true)
+    expect(sendChat).not.toHaveBeenCalled()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 11_000)
+    try {
+      await act(async () => { finish({ messages: [], running: false, has_more: false, total: 0 }) })
+      await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+      expect(sendChat.mock.calls[0]).toContain('chat-other')
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('does not send a slow launch after the user chooses another slot', async () => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    let finish!: (value: unknown) => void
+    chatSlotDetail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    launch({ message: PROMPT, slotKey: 'chat-other' })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    expect(store.getState().chat.slotLoading).toBe(true)
+    await act(async () => { await store.dispatch(switchSlot('chat-old')) })
+    await act(async () => { finish({ messages: [], running: false, has_more: false, total: 0 }) })
+    expect(store.getState().chat.activeSlot).toBe('chat-old')
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('keeps only the newer launch when target loads finish out of order', async () => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    let finish!: (value: unknown) => void
+    chatSlotDetail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    launch({ message: 'Older launch', slotKey: 'chat-other' })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    launch({ message: PROMPT, slotKey: 'chat-old' })
+    await act(async () => { navigateInTest('/chat?sid=chat-old') })
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await act(async () => { finish({ messages: [], running: false, has_more: false, total: 0 }) })
+    expect(sendChat).toHaveBeenCalledTimes(1)
+    expect(sendChat.mock.calls[0]).toContain('chat-old')
+    expect(sendChat.mock.calls[0]).toContain(PROMPT)
+  })
+
+  it.each([true, false])('restores URL sync when a new launch supersedes a slow target (autoSend=%s)', async (autoSend) => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    let finish!: (value: unknown) => void
+    chatSlotDetail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    launch({ message: 'Older launch', slotKey: 'chat-other' })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    launch({ message: PROMPT, autoSend })
+    await act(async () => { navigateInTest(autoSend ? '/chat' : '/chat?new=1') })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await act(async () => { finish({ messages: [], running: false, has_more: false, total: 0 }) })
+    await waitFor(() => expect(new URLSearchParams(locationInTest.search).get('sid')).toBe(NEW_SLOT))
+    await act(async () => { await store.dispatch(switchSlot('chat-old')) })
+    await waitFor(() => expect(new URLSearchParams(locationInTest.search).get('sid')).toBe('chat-old'))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    expect(sendChat).toHaveBeenCalledTimes(autoSend ? 1 : 0)
+    if (autoSend) expect(sendChat.mock.calls[0]).toContain(PROMPT)
+  })
+
+  it.each([404, 500])('shows failed target activation without sending (HTTP %s)', async (status) => {
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    chatSlotDetail.mockRejectedValueOnce(Object.assign(new Error('target load failed'), { status }))
+    launch({ message: PROMPT, slotKey: 'chat-other' })
+    await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    await waitFor(() => expect(screen.getByText('Couldn\'t open "chat-other". Try again.')).toBeTruthy())
+    expect(store.getState().chat.switchSlotGone).toBeNull()
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(createChatSlot).not.toHaveBeenCalled()
+    expect((window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch).toBeUndefined()
+  })
+
+  it('does not send an intent whose target was not activated', async () => {
+    launch({ message: PROMPT, slotKey: 'some-other-slot' })
+    const store = await renderAt('/chat?sid=chat-old')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-old'))
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('preserves the default new-session autosend behavior', async () => {
+    launch({ message: PROMPT })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(createChatSlot).toHaveBeenCalledTimes(1)
+    expect(sendChat.mock.calls[0]).toContain(NEW_SLOT)
   })
 })

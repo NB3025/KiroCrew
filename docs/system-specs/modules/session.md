@@ -18,6 +18,21 @@ silently reloading a fallback. The current request is delivered once and is not
 replayed as historical input. This includes cron, recovery and user-replay
 injections; queue drain supplies the exact appended row to the runner.
 
+## Dashboard app launch intents
+
+The App SDK's `slotKey` selects an existing dashboard slot through ordinary
+activation on both cold entry and navigation within an already-mounted chat.
+The session controller claims the target intent before URL synchronization and
+releases its message only after a fulfilled `switchSlot`. Slow activation does
+not expire a claimed message; failure shows only the existing session-open error
+and never sends to a fallback. A routed chat waits for that exact target before
+using the message; an embedded chat never consumes the dashboard intent.
+`autoSend: false` seeds
+an unsent draft. Without a target, the existing new-session controller creates
+one session and stages the draft before navigation, retaining it on creation
+failure for retry. Agent selection applies to new sessions only. These options
+do not attach app task metadata or change backend session authorization.
+
 ## Implementation Boundaries
 
 `SessionManager` remains the compatibility facade in `session.py`; callers keep

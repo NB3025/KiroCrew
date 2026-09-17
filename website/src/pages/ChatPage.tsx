@@ -1245,6 +1245,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [prefillEdited, setPrefillEdited] = useState(false)
   const raisePrefillHint = useCallback(() => { setPrefillHint(true); setPrefillEdited(false) }, [])
   const autoSendRef = useRef<string | null>(null)
+  const appLaunchTargetRef = useRef<string | undefined>(undefined)
   const [autoSendTick, setAutoSendTick] = useState(0)
   const newSessionRef = useRef(false)
   // True while the challenge-redirect token effect is creating/linking its
@@ -1535,20 +1536,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       }
     }
   }, [pendingInput, activeSlot, dispatch, searchParams, setSearchParams, saveDraftsDebounced, embedded, raisePrefillHint])
-
-  // Consume chat launch intent from app-sdk (useChatLauncher writes to window.__mc_chat_launch)
-  useEffect(() => {
-    const launchWindow = window as Window & {
-      __mc_chat_launch?: { ts?: number; agent?: string; message?: string }
-    }
-    const intent = launchWindow.__mc_chat_launch
-    if (!intent || Date.now() - (intent.ts ?? 0) > 10_000) return
-    delete launchWindow.__mc_chat_launch
-    if (intent.agent) setPendingAgent(intent.agent)
-    if (intent.message) { autoSendRef.current = intent.message; newSessionRef.current = true }
-    // setPendingAgent is a stable useState setter, so including it keeps this a
-    // mount-only "consume the one-shot window global" effect.
-  }, [setPendingAgent])
 
   // Consume ?prefill= — the no-main-window fallback path for navigation
   // intents forwarded from a popout (see utils/popoutController.ts). The
@@ -2151,6 +2138,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     tokenConsumingRef,
   })
   const {
+    appSlotLaunch,
+    setAppSlotLaunch,
     closeSessionTab,
     drawerPopRef,
     handleResumeSession,
@@ -2169,6 +2158,49 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     setSidError,
     sidError,
   } = session
+
+  // Only the routed chat consumes app launch intents. Existing-slot messages
+  // arrive here only after the session controller has fulfilled activation.
+  useEffect(() => {
+    if (embedded || !connected) return
+    const launchWindow = window as Window & {
+      __mc_chat_launch?: { ts?: number; agent?: string; message?: string; slotKey?: string; autoSend?: boolean }
+    }
+    const intent = appSlotLaunch ?? launchWindow.__mc_chat_launch
+    if (!intent) return
+    if (!appSlotLaunch) {
+      if (Date.now() - (launchWindow.__mc_chat_launch?.ts ?? 0) > 10_000) {
+        delete launchWindow.__mc_chat_launch
+        return
+      }
+      // The controller owns existing-slot activation and fresh-draft creation.
+      if (intent.slotKey || intent.autoSend === false) return
+      delete launchWindow.__mc_chat_launch
+    } else {
+      if (slotLoading) return
+      setAppSlotLaunch(null)
+      // A user switch while activation was pending cancels this launch rather
+      // than sending into whichever conversation they chose instead.
+      if (activeSlot !== intent.slotKey) return
+    }
+    // An existing slot keeps its own agent. Agent selection applies only to a
+    // new session, never as an implicit switch of an existing private binding.
+    if (intent.agent && !intent.slotKey) setPendingAgent(intent.agent)
+    if (!intent.message) return
+    if (intent.autoSend === false && activeSlot) {
+      newSessionRef.current = false
+      writePrefill(activeSlot, intent.message)
+      setDraft(drafts.current, activeSlot, intent.message)
+      saveDraftsDebounced()
+      setInput(intent.message)
+      raisePrefillHint()
+    } else {
+      autoSendRef.current = intent.message
+      appLaunchTargetRef.current = intent.slotKey
+      newSessionRef.current = !intent.slotKey
+      setAutoSendTick(t => t + 1)
+    }
+  }, [embedded, connected, activeSlot, slotLoading, location.key, appSlotLaunch, setAppSlotLaunch, saveDraftsDebounced, raisePrefillHint, setPendingAgent])
 
   // Auto-scroll during streaming — only when pinned to bottom
   const lastMsg = messages[messages.length - 1]
@@ -2864,7 +2896,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [connected, tabsCtl.activeTab, activeSlot, dispatch, send])
 
   // Auto-send when navigated with ?autoSend=1 or ?token= with prompt
-  useEffect(() => { if (connected && autoSendRef.current) { const txt = autoSendRef.current; autoSendRef.current = null; send(txt) } }, [send, connected, autoSendTick])
+  useEffect(() => {
+    if (!connected || !autoSendRef.current) return
+    const txt = autoSendRef.current
+    const target = appLaunchTargetRef.current
+    autoSendRef.current = null
+    appLaunchTargetRef.current = undefined
+    send(txt, target)
+  }, [send, connected, autoSendTick])
 
   // Widget interactivity: when a mcwidget iframe fires an action, PRE-FILL the
  // composer instead of auto-submitting. Auto-submitting would be a
