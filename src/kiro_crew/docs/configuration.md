@@ -431,7 +431,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 | `memory.private_provisioning_enabled` | Allow new private V2 stores for member creation, discovery sync and explicit V1-to-V2 setup; turning off leaves existing stores and their isolation active | `true` |
-| `memory.backup_enabled` | Periodic rotating backups of active member V2 stores only; V1 backups remain manual and retention does not delete active V2 memories | `true` |
+| `memory.backup_enabled` | Periodic rotating backups of every active memory store (the default store, named V1 stores and member V2 stores); retention does not delete active memories | `true` |
 | `memory.backup_keep` | Backup copies retained per store, with a minimum of one | `7` |
 
 Decay, episodic capacity eviction and history age pruning apply to V1 only.

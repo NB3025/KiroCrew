@@ -2170,7 +2170,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Automatic Memory Backups",
-      "help": "Take a daily rotating copy of each active member V2 store. Global and named V1 backups remain manual. This does not delete active memories.",
+      "help": "Take a daily rotating copy of every active memory store: the default store, named V1 stores and member V2 stores. This does not delete active memories.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true

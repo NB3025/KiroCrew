@@ -1915,8 +1915,10 @@ no new restore intent and leaves any existing journal and live memory intact.
 
 Memory is the only data here that cannot be rebuilt from another source: config can be
 retyped and sessions replayed, but a superseded preference nobody remembers stating is
-gone. Active member V2 stores get a daily rotating hot copy. Global and named V1
-stores are copied only when the owner requests a manual backup. The heartbeat schedules its
+gone. Every active store gets a daily rotating hot copy: the default store first, then
+declared named V1 stores and actively owned member V2 stores. The default store is
+never left to a manual copy, because it is the one every install has and typically
+the largest. The heartbeat schedules its
 first pass at the first eligible tick after memory readiness, then uses its
 existing daily tick cadence and per-store freshness checks. One tracked task
 runs the serial copy pass in `maintenance_executor`; a tick never waits for a
@@ -1944,12 +1946,13 @@ self-contained file with no WAL to pair.
 - **Retention**: `memory.backup_keep` (default 7), clamped to at least 1. A retention
   policy that can empty the directory is a scheduled deletion, not retention.
   The loader preserves this value and `memory.backup_enabled` (default true)
-  across reload/save, so disabling automatic V2 backups or extending recovery
-  retention survives a gateway restart. Automatic retention never visits V1.
+  across reload/save, so disabling automatic backups or extending recovery
+  retention survives a gateway restart. Automatic retention prunes only the
+  backup directory of the store it just copied and never touches archived stores.
   Manual dashboard backups use the same configured retention in their worker.
-- **Enumeration**: the heartbeat passes `private_only=True` and visits only
-  actively owned V2 stores. The explicit all-store backup helper retains Global,
-  declared named V1 stores and active V2 stores. Neither uses a glob of `memory_stores/`: a glob
+- **Enumeration**: the heartbeat and the `kirocrew memory backup` command share one
+  helper that visits the default store, declared named V1 stores and actively owned
+  V2 stores. Neither uses a glob of `memory_stores/`: a glob
   would adopt an abandoned or restored directory the operator never declared and then
   copy it forever. Each resolved path is confirmed to belong to the store that asked for
   it, independently of strict binding resolution.

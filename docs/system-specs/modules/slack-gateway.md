@@ -66,15 +66,16 @@ retrieval, admission, decay, consolidation and capacity behavior remain
 unchanged.
 
 The first heartbeat after memory becomes ready schedules a tracked background
-backup pass for active member V2 stores only. Global and named V1 backups remain
-manual. Existing per-store backup freshness prevents duplicate copies across
+backup pass for every active memory store: the default store first, then declared
+named V1 stores and active member V2 stores.
+Existing per-store backup freshness prevents duplicate copies across
 restarts; later checks retain the daily cadence at tick 30 modulo 1440. A large
-member ZIP does not delay subsequent heartbeat ticks or idle-session checks.
+store does not delay subsequent heartbeat ticks or idle-session checks.
 Only one backup pass belongs to a heartbeat service at a time. Shutdown signals
 its worker to finish at most the current atomic copy, then skip pruning and all
 remaining stores. Stopping the async waiter never resets that worker's stop flag.
-Automatic backup enumeration excludes V1 and archived, unbound private stores.
-Manual all-store backups include declared V1 and active V2 stores. Archived files
+Automatic backup enumeration excludes archived, unbound private stores.
+Manual all-store backups visit the same set. Archived files
 and backup listings remain available for owner inspection; restore requires an
 active exclusive binding and there is no archive reattachment UI.
 

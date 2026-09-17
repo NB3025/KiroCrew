@@ -2143,8 +2143,9 @@ class MemoryConfig:
         default=True,
         metadata=_meta(
             "Automatic Memory Backups",
-            "Take a daily rotating copy of each active member V2 store. Global and "
-            "named V1 backups remain manual. This does not delete active memories.",
+            "Take a daily rotating copy of every active memory store: the default "
+            "store, named V1 stores and member V2 stores. This does not delete active "
+            "memories.",
         ),
     )
     backup_keep: int = field(
