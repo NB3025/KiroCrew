@@ -5351,6 +5351,11 @@ class GatewayOrchestrator:
 
                 if _model_downgraded:
                     result_text = _annotate_model_downgrade(result_text)
+                # Previous result text, read BEFORE set_run_result overwrites it.
+                # The novelty shadow below compares the two texts, and past this
+                # line the only surviving trace of the old one is its hash.
+                _prev_cron_result = job.last_result or ""
+
                 result_text = _annotate_model_fallback(result_text, client)
 
                 job.set_run_result(result_text)
@@ -5458,6 +5463,29 @@ class GatewayOrchestrator:
                                 context_reading=_ctx_reading,
                             )
                         return result_text
+
+                # DecisionOracle shadow (cron.novelty) — the hashes differ, so this
+                # result is being delivered. Ask an oracle whether it actually says
+                # anything the previous one did not, and log the answer beside the
+                # delivery that happened. Fire-and-forget and never read: delivery
+                # cannot be suppressed from here.
+                if rh != job.last_posted_hash:
+                    try:
+                        from kiro_crew.decisions.points.cron_novelty import (
+                            shadow_cron_novelty,
+                        )
+
+                        asyncio.get_running_loop().create_task(
+                            shadow_cron_novelty(
+                                job.id,
+                                job.name,
+                                _prev_cron_result,
+                                result_text,
+                                session_key=f"cron:{job.id}",
+                            )
+                        )
+                    except Exception:
+                        logger.debug("cron.novelty shadow hook skipped", exc_info=True)
 
                 if job.silent:
                     logger.info("Cron job '%s' silent — suppressing auto-delivery", job.name)

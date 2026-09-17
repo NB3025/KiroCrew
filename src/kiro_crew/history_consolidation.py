@@ -1790,6 +1790,29 @@ class HistoryConsolidator:
                 "triggers": triggers,
             }
             verdict, key = _facade_metadata_dedupe_verdict(candidate, existing, _judge_fn)
+            # DecisionOracle shadow (skills.dedupe) — put the same candidate
+            # and the same existing set to an oracle and log whether it reaches
+            # the judge's verdict. This function runs on a worker thread with a
+            # captured loop (see _judge_fn above), so the hook is submitted to
+            # that loop and NOT waited on: the verdict below is the LLM judge's,
+            # unchanged.
+            try:
+                from kiro_crew.decisions.points.skills_dedupe import (
+                    shadow_skills_dedupe,
+                )
+
+                asyncio.run_coroutine_threadsafe(
+                    shadow_skills_dedupe(
+                        candidate,
+                        existing,
+                        verdict,
+                        key,
+                        session_key=f"skill_dedupe:{slug}",
+                    ),
+                    loop,
+                )
+            except Exception:
+                self._logger.debug("skills.dedupe shadow hook skipped", exc_info=True)
             # VERDICT_NEW means "new" OR a judge error (the verdict API fails open
             # to new). Either way, confirm with the cheap lexical check before
             # concluding the candidate is unique.

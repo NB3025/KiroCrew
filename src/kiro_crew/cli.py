@@ -1871,6 +1871,7 @@ Examples:
     )
 
     register_perf_parser(sub)
+    register_decisions_parser(sub)
     register_bench_parser(sub)
     register_desktop_parser(sub)
 
@@ -3247,6 +3248,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _consolidate_cmd(args)
     elif args.command == "config":
         _config_cmd(args)
+    elif args.command == "decisions":
+        rc = decisions_cmd(args)
+        if rc:
+            raise SystemExit(rc)
     elif args.command == "perf":
         rc = perf_cmd(args)
         if rc:
@@ -3304,6 +3309,7 @@ from kiro_crew.cli_chat import _run_chat  # noqa: E402
 from kiro_crew.cli_cloud import add_size_choices as _cloud_size_choices  # noqa: E402
 from kiro_crew.cli_cloud import handle_cloud  # noqa: E402
 from kiro_crew.cli_config import _config_cmd  # noqa: E402
+from kiro_crew.cli_decisions import decisions_cmd, register_decisions_parser  # noqa: E402
 from kiro_crew.cli_desktop import desktop_cmd, register_desktop_parser  # noqa: E402
 from kiro_crew.cli_doctor import _doctor  # noqa: E402
 from kiro_crew.cli_perf import perf_cmd, register_perf_parser  # noqa: E402

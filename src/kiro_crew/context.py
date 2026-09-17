@@ -4746,6 +4746,35 @@ class ContextBuilder:
         # in the window.
         if not is_custom and not minimal_context:
             triggered = self.skills.get_triggered_skills(text, project_dir=project)
+
+            # DecisionOracle shadow (skills.select) — record what an oracle
+            # would have selected for this message, beside what trigger
+            # matching did. Fire-and-forget: `triggered` is not read back and
+            # nothing below sees this, so the injected skill list is identical
+            # to a tree without the seam. Two reasons it cannot be awaited here:
+            # build_message is synchronous, and a selection budget on the turn's
+            # critical path is a separate change. Candidate enumeration is
+            # passed as a callable so it runs on the task, not on this line.
+            # Silent by construction — no running loop, no core package, or any
+            # failure inside the hook leaves message assembly untouched.
+            try:
+                from kiro_crew.decisions.points.skills_select import (
+                    candidates_from_loader,
+                    shadow_skills_select,
+                )
+
+                _decisions_loop = asyncio.get_running_loop()
+                _decisions_loop.create_task(
+                    shadow_skills_select(
+                        text,
+                        lambda: candidates_from_loader(self.skills, project),
+                        list(triggered),
+                        session_key=session_key,
+                    )
+                )
+            except Exception:
+                logger.debug("skills.select shadow hook skipped", exc_info=True)
+
             if triggered:
                 enforced, pointer_only = self.skills.split_triggered(triggered, project)
                 # Log the split, not just the match: a pointed-at skill the
