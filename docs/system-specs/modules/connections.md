@@ -987,6 +987,44 @@ banner allowlist stays registry-derived while the admission is pursued.
 Rungs 1–4 are what this roster's gated entries have; rung 5 is what they wait
 on.
 
+## What a card shows inline, and what it hides behind the triangle
+
+A Connections card is one cell of a grid, so every line it renders is paid by
+every card that reaches the same state. The card therefore has exactly three
+kinds of content, and a new state or a new piece of copy lands in one of them:
+
+| Content | Where it renders | Examples |
+|---|---|---|
+| The state, in a word | the header badge (icon + label) | Not connected, Needs configuration, Connected |
+| A **pre-action caveat** — what the user should know before pressing the row's action, or what pressing it entails | the amber warning triangle (`PrerequisiteTip`) placed immediately before that action, in the same row: hover or focus previews the copy, click pins it, Escape or an outside press dismisses it | GitLab's Duo/group requirement and Atlassian's site requirement beside **Connect**; the one-time OAuth-app setup explanation beside **Configure OAuth app** |
+| A **verdict the user must act on**, or a form the state needs | an inline band, the only thing allowed to add a row | the not-verified / not-authorized verdict, the needs-attention diagnosis, the return-address relay while waiting for approval |
+
+The line between the last two is what the copy is *about*. A verdict reports a
+fact about the card's current state; a caveat annotates a button. Copy phrased
+as "X needs …", "Y opens …", "requires …", "before you …" is a caveat and goes
+in the triangle however important it feels — importance is why it sits next to
+the action the user is about to press, not a reason to grow the card. One
+triangle per action row; two caveats for one action merge into one bubble.
+
+This was decided by trying the alternative: the prerequisite warnings were
+built as always-visible bands while under review and were reverted to the
+triangle on the maintainer's ruling before they merged, so the bands never
+reached `main`. The needs-configuration state later shipped a band for its
+setup explanation and was moved behind the triangle the same way. A
+review-lane suggestion to "make the warning visible" is answered by this
+section and by `website/AUTOSDE.yaml`'s blocking `connection-card-caveat-tip`
+rule, which names the same three kinds; the frontend test that renders the
+needs-configuration card pins the explanation as absent from the document
+until the triangle is hovered.
+
+The triangle's copy comes from two places. A provider-side prerequisite is the
+registry's `prerequisite_copy` (English fallback) rendered through the
+slug-keyed `prerequisite_<slug>` catalog entries, kept in lockstep by a test;
+a state-level caveat, like the setup explanation, is an ordinary catalog key
+(`needs_configuration_help`). Both ride under the one `before_you_connect`
+heading with the `prerequisites_for_provider` accessible name — a new state
+reuses them rather than adding a second tooltip component or heading.
+
 ## Pre-registered OAuth clients
 
 Most providers let kiro-cli register a public OAuth client at runtime (RFC 7591),
@@ -1039,17 +1077,22 @@ the emitted entry verbatim, so the cold path inherits it.
 **What the user sees.** `get_visible_providers` shows a pre-registered entry
 regardless of `launch_gate_passed` (vendor approval still hides), because until
 a client exists the card is an instruction, not an offer: `/api/connections/status`
-marks the row `needsClientConfig` (only while no grant is held), the card renders
-the sixth state `needs-configuration` — "an administrator must configure an
-OAuth app" — with a link to **Settings → OAuth Apps**, where one card per
-pre-registered provider carries the redirect URI to copy, the Client ID field,
-the Client secret field (write-only, vault-backed) and the runbook link. The
-routes behind it are `GET /api/connections/oauth-clients` (any dashboard user;
-no secret value) and owner-only `PUT` / `DELETE
-/api/connections/oauth-clients/{slug}`. The launch gate keeps governing the
-entry's quality claims: a configured GitHub still runs the normal first-connect
-(`not-verified`) flow, and `launch_gate_passed` flips only after the manual L2
-walk with an operator-registered app.
+marks the row `needsClientConfig` (only while no grant is held), and the card
+renders the sixth state `needs-configuration` — a lock badge, the Documentation
+link, and a **Configure OAuth app** route to **Settings → OAuth Apps** in place
+of Connect. What the setup involves (a guided settings page, nothing changes
+until saved, removable later, registers an app and enters its client ID and
+secret) is the row's pre-action caveat, so it sits behind the amber triangle
+beside that route, never as a band — see [What a card shows
+inline](#what-a-card-shows-inline-and-what-it-hides-behind-the-triangle). On
+the Settings tab one card per pre-registered provider carries the redirect URI
+to copy, the Client ID field, the Client secret field (write-only, vault-backed)
+and the runbook link. The routes behind it are
+`GET /api/connections/oauth-clients` (any dashboard user; no secret value) and
+owner-only `PUT` / `DELETE /api/connections/oauth-clients/{slug}`. The launch
+gate keeps governing the entry's quality claims: a configured GitHub still runs
+the normal first-connect (`not-verified`) flow, and `launch_gate_passed` flips
+only after the manual L2 walk with an operator-registered app.
 
 **Runbooks.** One per provider under `docs/guides/oauth-app-registration/`
 (index in its `README.md`): console, app type, scopes, the exact redirect URI,
