@@ -1217,9 +1217,24 @@ def test_member_history_tools_cannot_cross_private_store(
         "api_session_control_read",
     ],
 )
-async def test_member_cannot_bypass_spawn_via_unbound_session_control(
+async def test_ordinary_private_caller_cannot_reach_owner_via_session_control(
     env, member_proof, handler_name
 ):
+    """A private V2 caller that is NOT a crew-member DM slot stays refused on all
+    five routes.
+
+    This is the narrowed residual of the former blanket refusal. The caller here
+    is ``dashboard:alice`` — a verified V2 caller, but NOT a ``member-*`` DM slot
+    — so it must not reach ``dashboard:owner`` (an unbound/owner session) or
+    borrow Global V1 memory by creating a session on the ``default`` agent. The
+    ``member_scope_denied`` refusal in ``_require_internal`` still fires for it,
+    because the member admission is keyed on the ``member-*`` session key.
+
+    A genuine crew-member DM slot IS admitted through this gate now (the member
+    operating model); that path, and the ownership fence that bounds it, are
+    covered by ``test_session_control_member_gate`` and
+    ``test_member_session_control``.
+    """
     from kiro_crew.dashboard.handlers import session_control
 
     response = await getattr(session_control, handler_name)(

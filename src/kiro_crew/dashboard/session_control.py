@@ -56,7 +56,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
-from kiro_crew.memory_stores import named_store_or_empty
+from kiro_crew.memory_stores import memory_store_version, named_store_or_empty
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.validation import MAX_LONG_STRING
@@ -1062,6 +1062,33 @@ async def create_session(
             code="agent_unresolved",
         )
 
+    # A workspace is not a memory silo: it can host agents on different stores,
+    # so a private member could otherwise mint a worker on `default`/global or a
+    # peer's store. require_memory_delegation is the guard the private spawn path
+    # uses -- a no-op for a caller with no private record, a refusal of any
+    # target_store that is not a private V2 caller's own. Off-loop: it reads the
+    # caller's binding from disk.
+    from kiro_crew.context import require_memory_delegation
+    from kiro_crew.member_memory_auth import read_private_session_store
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    try:
+        await asyncio.to_thread(
+            require_memory_delegation, log, caller_session_key, bindings.memory_store_name
+        )
+        # Only a protected caller record can authorize a child's private binding.
+        # Agent selection and editable slot metadata are not private authority.
+        caller_private_store = await asyncio.to_thread(
+            read_private_session_store, caller_session_key
+        )
+    except (UnknownMemoryStore, ValueError) as exc:
+        # UnknownMemoryStore is the delegation refusal proper; ValueError is the
+        # corrupt/unreadable binding-file case require_memory_delegation surfaces
+        # through read_private_session_store. Both are a store the caller may not
+        # delegate into -- map to one refusal rather than letting the bare
+        # ValueError escape as an unhandled 500.
+        raise SessionControlError(str(exc), code="agent_store_mismatch") from exc
+
     # SlotOrigin.USER, not SYSTEM: the visibility semantics must match an
     # ordinary session, because the point of creating it here is that the user
     # can see and take over the work. SYSTEM-origin slots fall outside the
@@ -1289,6 +1316,39 @@ async def create_session(
         if title.strip():
             slot.title = sanitize_outbound(title.strip())[:200]
             slot._titled = True
+        # Bind only within the caller's protected store. An unbound/global caller
+        # may select a private agent, but that selection must not confer private
+        # authority. Its child keeps the ordinary, unbound creation behavior.
+        # The turn path reads this binding on the child's effective key, not its
+        # editable memory_store metadata. Write it before birth persistence and
+        # publication so a member's worker can take its first turn.
+        _store_name = named_store_or_empty(slot.memory_store)
+        if _store_name and caller_private_store == _store_name:
+            from kiro_crew.member_memory_auth import bind_private_session_store
+
+            try:
+                if await asyncio.to_thread(memory_store_version, _store_name) == 2:
+                    await asyncio.to_thread(
+                        bind_private_session_store, effective_session_key(slot), _store_name
+                    )
+            except BaseException as exc:
+                # Both off-loop hops can be cancelled. Retract before the suspended
+                # broadcast flushes, but never orphan a turn already in flight.
+                if not slot.running and not slot.messages:
+                    state._slots.pop(slot.key, None)
+                    state.push_slots_update()
+                if not isinstance(exc, Exception):
+                    raise
+                logger.warning(
+                    "create_session: binding child %s to private store %s failed; retracting",
+                    slot.key,
+                    _store_name,
+                    exc_info=True,
+                )
+                raise SessionControlError(
+                    "could not bind the new session to the caller's private memory",
+                    code="agent_store_mismatch",
+                ) from exc
         # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
         # returns early on an empty message window -- a full save has nothing to
         # write -- so a freshly created session, which has no messages by

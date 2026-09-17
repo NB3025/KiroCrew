@@ -194,6 +194,59 @@ operator configuration. Two rules give it that shape:
 
 Ordinary (non-member) callers are untouched: they still require the switch.
 
+#### The strict-internal surface admits a member DM slot, not any private caller
+
+The five routes sit behind `_require_internal`, which first refuses anything
+without a valid `X-Internal-Secret`, and then — on the authenticated branch —
+runs one private-member gate (`_private_caller_refusal`). That gate resolves the
+caller's private authority ONCE (`internal_memory_scope`) and decides:
+
+- an **owner / Global-V1 caller** (no private scope) falls through to the handler,
+  exactly as the surface behaved before member dispatch existed;
+- a **crew-member DM slot** (a `member-*` session key) is ADMITTED while the
+  surface is reachable for it — `agent.member_dispatch` OR the global
+  `agent.session_control` switch — so its request reaches `session_control.py`
+  where the creator-ownership fence above does the real gating;
+- **every other verified private V2 caller** — an ordinary private member, or a
+  member while BOTH switches are off — keeps the `member_scope_denied` 403;
+- an **unverifiable caller** keeps the `member_session_unverified` 403.
+
+The gate reads the SAME two switches the switch gate does — `member_dispatch` is
+a bypass ON TOP of `session_control`, not a replacement, so a member with
+`member_dispatch` off falls back UNDER the global switch rather than out of a
+surface the operator left open to everyone. Both reads fail closed on an
+unreadable config, so the surface can never open wider than the two switches
+behind it. This gate replaced a blanket refusal that returned `member_scope_denied`
+to every verified V2 caller — which made the member operating model unreachable
+even though `session_control.py` already carried the member fence. The refusal for
+a non-member private caller is unchanged; only the member DM slot's admission is
+new.
+
+#### A member-created worker stays inside its own private memory
+
+Two guards in `create_session` keep a member's dispatch from laundering work out
+of its private store:
+
+- **`require_memory_delegation`** runs before the slot is minted. A workspace is
+  not a memory silo — it can host agents bound to different stores — so a private
+  V2 member could otherwise resolve an agent bound to `default`/global or a peer's
+  store. The guard (the one the private spawn path uses) is a no-op for a caller
+  with no private record and a refusal of any target store that is not the private
+  V2 caller's own; the refusal, and a corrupt/unreadable binding file, both map to
+  the `agent_store_mismatch` 4xx rather than an unhandled 500.
+- **The child's private binding** is written at birth only when the caller's
+  protected session record names the child's resolved V2 store. Agent selection
+  and editable slot metadata cannot grant private authority. An unbound/global
+  caller keeps ordinary creation behavior, with no private binding even when the
+  chosen agent names a V2 store. A private caller aimed at a foreign or global
+  store is refused by the delegation guard above.
+  The binding uses the child's effective session key — the key the turn path's
+  `_bind_private_slot_memory` reads. Without it a member's worker cannot take its
+  first turn. It is written before the slot's birth metadata or broadcast. A
+  version-read or binding-write failure retracts an idle, empty child and reports
+  `agent_store_mismatch`; cancellation retracts the same way and propagates.
+  Work already running is never orphaned by retraction.
+
 ### The fence propagates to what a fenced caller creates
 
 `_caller_is_ownership_fenced` covers three populations, not two: a member DM slot,

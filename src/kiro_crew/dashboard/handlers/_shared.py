@@ -569,13 +569,15 @@ async def private_chat_route_refusal(request: web.Request) -> web.Response | Non
     return await private_owner_surface_refusal(request, "chat.control")
 
 
-async def private_owner_surface_refusal(
-    request: web.Request, operation: str
-) -> web.Response | None:
-    """Private tools use their scoped API, never the owner's aggregate controls."""
-    scope, refusal = await internal_memory_scope(request, operation)
-    if refusal is not None or scope is None:
-        return refusal
+async def member_scope_denied_refusal(operation: str) -> web.Response:
+    """The ``member_scope_denied`` 403, audited under *operation*.
+
+    Extracted so a caller that has ALREADY resolved a private scope (the
+    session-control gate, which then decides member callers separately) can emit
+    the exact same refusal and audit line as :func:`private_owner_surface_refusal`
+    WITHOUT re-running :func:`internal_memory_scope` a second time. One
+    implementation, so the two paths cannot drift on the wording or the audit.
+    """
     await _audit_private_memory_denial(
         operation, "A private member cannot use the owner's aggregate controls."
     )
@@ -586,6 +588,16 @@ async def private_owner_surface_refusal(
         },
         status=403,
     )
+
+
+async def private_owner_surface_refusal(
+    request: web.Request, operation: str
+) -> web.Response | None:
+    """Private tools use their scoped API, never the owner's aggregate controls."""
+    scope, refusal = await internal_memory_scope(request, operation)
+    if refusal is not None or scope is None:
+        return refusal
+    return await member_scope_denied_refusal(operation)
 
 
 #: A check that runs before a route handler; a response it returns is the answer.

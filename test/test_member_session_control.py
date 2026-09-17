@@ -23,12 +23,17 @@ every verb terminates in these gates.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from chat_test_helpers import _make_state
 
+from kiro_crew.dashboard import create_rate_limit
 from kiro_crew.dashboard import session_control as sc
+from kiro_crew.dashboard.chat_utils import slot_history_key
+from kiro_crew.dashboard.state import SlotOrigin
 from kiro_crew.members import DM_SLOT_KEY_PREFIX
 
 
@@ -315,3 +320,377 @@ class TestMemberDispatchCeiling:
         from kiro_crew.config.sections import AgentConfig
 
         assert AgentConfig().member_dispatch is True
+
+
+_MEMBER = DM_SLOT_KEY_PREFIX + "radar"
+
+
+@pytest.fixture
+def _fresh_create_budget():
+    """The per-caller create-rate window is process-wide module state."""
+    create_rate_limit.reset_for_tests()
+    yield
+    create_rate_limit.reset_for_tests()
+
+
+def _member_tab(state):
+    """A crew member's own DM slot, as the member-thread endpoint mints it.
+
+    ``mode="member"`` is the one path the slot registry admits a ``member-``
+    key through; the agent is left to inherit so a name that does not resolve
+    in the test config cannot pre-empt the gates under test.
+    """
+    return state.get_or_create_slot(_MEMBER, mode="member")
+
+
+class TestMemberDispatchEndToEnd:
+    """The member contract driven through the REAL create/authorize paths.
+
+    ``TestAuthorizeTargetMemberPath`` above pins the gate order with a fake
+    state; this pins the whole ``create_session`` / ``authorize_target``
+    transaction against a real ``DashboardState`` — the child is actually
+    minted, attributed, and then reached (or refused) by the same functions
+    production runs. It is the member twin of ``test_cron_session_control``'s
+    end-to-end classes.
+    """
+
+    def test_a_member_creates_an_attributed_user_origin_child(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        # The child inherits the caller's workspace; pin the binding's workspace
+        # name to it so the agent-workspace check passes without a config fixture.
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        # Switch OFF on purpose: the member bypass is what admits the create.
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+
+        child = state.get_slot(result["target"])
+        assert child is not None
+        # `created_by` is the fence's only input, so the create must write it.
+        assert child._created_by == _MEMBER
+        # USER, unlike a cron child: a member's worker is meant to be visible in
+        # the sidebar and taken over by the person, so it must reach `slots:user`.
+        assert child._origin == SlotOrigin.USER
+
+    def test_the_global_switch_does_not_gate_a_member_create(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        assert state.get_slot(result["target"]) is not None
+
+    def test_member_create_is_refused_when_the_ceiling_is_off(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        # Switch off AND ceiling off: the member falls back under the switch and
+        # is refused exactly like an ordinary caller — no bypass, no session.
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: False)
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        assert exc.value.code == "session_control_disabled"
+
+    def test_a_member_reaches_its_own_worker(self, tmp_path, monkeypatch, _fresh_create_budget):
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        worker = state.get_slot(result["target"])
+        for op in ("send", "read", "stop", "close"):
+            resolved = sc.authorize_target(
+                state,
+                caller_session_key=slot_history_key(caller),
+                target=worker.key,
+                operation=op,
+            )
+            assert resolved is worker, op
+
+    def test_a_member_cannot_reach_a_session_it_did_not_create(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        # The user's own conversation — protected by the ownership fence, not by
+        # a blanket refusal of the member.
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        state.get_or_create_slot("chat-7", workspace=caller.workspace)
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            sc.authorize_target(
+                state,
+                caller_session_key=slot_history_key(caller),
+                target="chat-7",
+                operation="send",
+            )
+        assert exc.value.code == "not_creator"
+        assert "crew member" in exc.value.message
+
+    def test_member_create_into_a_foreign_store_is_refused(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        # A workspace is not a memory silo: a private V2 member could otherwise
+        # mint a worker whose resolved agent is bound to `default`/global or a
+        # peer's store, laundering work out of its own private memory. The
+        # `require_memory_delegation` guard (the same one the private spawn path
+        # uses) refuses that, and `create_session` maps it to
+        # `agent_store_mismatch`. The child agent-workspace check must pass first,
+        # so pin `_workspace_name_for_dir` as the other end-to-end tests do; the
+        # delegation guard itself is stubbed to reject, isolating this seam from
+        # the member-binding plumbing exercised in test_member_memory_api.
+        import kiro_crew.context as context
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        def _reject(_log, _parent, _target_store):
+            raise UnknownMemoryStore(
+                "A Crew Member's tasks must retain that member's private memory."
+            )
+
+        monkeypatch.setattr(context, "require_memory_delegation", _reject)
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        assert exc.value.code == "agent_store_mismatch"
+        # No session is left behind on refusal.
+        assert state.creator_slot_count(_MEMBER) == 0
+
+    def test_member_create_maps_a_corrupt_binding_valueerror(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        # require_memory_delegation reads the caller's binding from disk; a
+        # corrupt/unreadable binding file surfaces as a bare ValueError, not
+        # UnknownMemoryStore. It must map to the same agent_store_mismatch refusal
+        # rather than escaping create_session as an unhandled 500.
+        import kiro_crew.context as context
+
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: False)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+
+        def _corrupt(_log, _parent, _target_store):
+            raise ValueError("The protected member session binding is missing or unreadable")
+
+        monkeypatch.setattr(context, "require_memory_delegation", _corrupt)
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        assert exc.value.code == "agent_store_mismatch"
+        assert state.creator_slot_count(_MEMBER) == 0
+
+
+class TestMemberChildPrivateBinding:
+    """A member-created child on a V2 agent is bound to its private store BEFORE
+    ``create_session`` returns.
+
+    ``slot.memory_store`` alone is transcript metadata a save reads back; it is
+    NOT the immutable per-session binding the turn path checks. Without a real
+    binding record, a member-minted worker's first ``session_send`` runs
+    ``_bind_private_slot_memory`` -> ``read_private_session_store`` -> ``None`` ->
+    ``memory_unavailable``, so the worker a member just dispatched can never take
+    a turn. These tests pin that ``create_session`` writes the binding the SAME
+    read path (``read_private_session_store`` on the child's EFFECTIVE session
+    key) will later find, and that a binding failure retracts the child rather
+    than returning a doomed slot.
+
+    Only agent resolution is stubbed. The caller's protected record, delegation
+    guard and child's binding write use the real private-memory path.
+    """
+
+    def _pin_v2_bindings(self, monkeypatch, tmp_path, state, caller, store, *, private=True):
+        """Declare *store* as a V2 store on disk and make create_session resolve to it."""
+        from pathlib import Path
+
+        from member_memory_helpers import forget_declared_stores, write_member_home
+
+        from kiro_crew.config.sections import ResolvedBindings
+        from kiro_crew.member_memory_auth import bind_private_session_store
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        # write_member_home lays down the manifest AND the config.json that names
+        # the store, so require_memory_store (which the binding write calls)
+        # recognizes it. `store` is `member-<member>`; derive the member back.
+        write_member_home(tmp_path, store.removeprefix("member-"))
+        # require_memory_store also validates the store's vector DB exists, so
+        # initialize it the same way member_memory_helpers.env does.
+        from kiro_crew import memory_stores as _ms
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        _tier = VectorMemoryStore(db_path=tmp_path / "memory_stores" / store / _ms.MEMORY_DB_FILE)
+        _tier.init()
+        _tier.close()
+        forget_declared_stores(monkeypatch)
+
+        bindings = ResolvedBindings(
+            workspace_dir=Path("workspace"),
+            memory_store_name=store,
+            effective_memory_config={},
+            kiro_agent="kiro",
+        )
+        monkeypatch.setattr(sc, "resolve_agent_bindings", lambda *a, **k: bindings)
+        monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+        monkeypatch.setattr(sc, "session_control_enabled", lambda: not private)
+        monkeypatch.setattr(sc, "member_dispatch_enabled", lambda: True)
+        if private:
+            bind_private_session_store(slot_history_key(caller), store)
+            state.conversation_log.update_metadata(
+                slot_history_key(caller), {"memory_store": store}
+            )
+        return bindings
+
+    @pytest.mark.parametrize("via_http", [False, True])
+    def test_child_has_a_binding_readable_by_the_turn_path(
+        self, tmp_path, monkeypatch, _fresh_create_budget, via_http
+    ):
+        import json
+        import os
+
+        from member_memory_helpers import make_request
+
+        from kiro_crew import member_memory_auth, platform_compat
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.dashboard.handlers.session_control import api_session_control_create
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        self._pin_v2_bindings(monkeypatch, tmp_path, state, caller, "member-radar")
+        caller_key = slot_history_key(caller)
+
+        if via_http:
+            monkeypatch.setattr(platform_compat, "get_process_start_id", lambda pid: f"test-{pid}")
+            member_memory_auth.publish_member_session_pid(
+                os.getpid(), caller_key, memory_store="member-radar"
+            )
+            proof = member_memory_auth.issue_member_session_proof(caller_key, os.getpid())
+            assert proof
+
+            async def _create():
+                response = await api_session_control_create(
+                    make_request(
+                        state,
+                        "/api/session-control/create",
+                        body={},
+                        internal=True,
+                        session=caller_key,
+                        proof=proof,
+                    )
+                )
+                assert response.status == 200, response.text
+                return json.loads(response.text)
+
+            result = asyncio.run(_create())
+        else:
+            result = asyncio.run(sc.create_session(state, caller_session_key=caller_key))
+        child = state.get_slot(result["target"])
+        assert child is not None
+
+        # The turn path reads this exact protected key, not editable slot metadata.
+        child_key = effective_session_key(child)
+        assert read_private_session_store(child_key) == "member-radar"
+
+    def test_global_caller_cannot_grant_a_child_private_authority(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        state = _make_state(tmp_path)
+        caller = state.get_or_create_slot("chat-owner")
+        self._pin_v2_bindings(monkeypatch, tmp_path, state, caller, "member-radar", private=False)
+        assert read_private_session_store(slot_history_key(caller)) is None
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        child = state.get_slot(result["target"])
+        assert child is not None
+        assert child.memory_store == "member-radar"
+        assert read_private_session_store(effective_session_key(child)) is None
+
+    @pytest.mark.parametrize("target_store", ["default", "member-peer"])
+    def test_private_caller_cannot_delegate_into_another_store(
+        self, tmp_path, monkeypatch, _fresh_create_budget, target_store
+    ):
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        bindings = self._pin_v2_bindings(monkeypatch, tmp_path, state, caller, "member-radar")
+        bindings.memory_store_name = target_store
+
+        with pytest.raises(sc.SessionControlError) as exc:
+            asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        assert exc.value.code == "agent_store_mismatch"
+        assert state.creator_slot_count(_MEMBER) == 0
+
+    def test_a_v1_child_writes_no_private_binding(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        state = _make_state(tmp_path)
+        caller = state.get_or_create_slot("chat-owner")
+        bindings = self._pin_v2_bindings(
+            monkeypatch, tmp_path, state, caller, "member-radar", private=False
+        )
+        bindings.memory_store_name = "default"
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        child = state.get_slot(result["target"])
+        assert read_private_session_store(effective_session_key(child)) is None
+
+    @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+    @pytest.mark.parametrize("fail_at", ["version", "binding"])
+    def test_a_binding_failure_retracts_the_child(
+        self, tmp_path, monkeypatch, _fresh_create_budget, failure, fail_at
+    ):
+        import kiro_crew.member_memory_auth as member_memory_auth
+
+        state = _make_state(tmp_path)
+        caller = _member_tab(state)
+        self._pin_v2_bindings(monkeypatch, tmp_path, state, caller, "member-radar")
+        published = []
+        monkeypatch.setattr(state, "_slots_broadcast_lock", None)
+        monkeypatch.setattr(
+            state, "_do_slots_broadcast", lambda: published.append(set(state._slots))
+        )
+        monkeypatch.setattr(
+            state.conversation_log, "update_metadata", lambda *a: pytest.fail("persisted")
+        )
+
+        def _boom(*_args):
+            raise failure("binding preparation failed")
+
+        if fail_at == "binding":
+            monkeypatch.setattr(member_memory_auth, "bind_private_session_store", _boom)
+        else:
+            monkeypatch.setattr(sc, "memory_store_version", _boom)
+
+        expected = sc.SessionControlError if failure is RuntimeError else failure
+        with pytest.raises(expected) as exc:
+            asyncio.run(sc.create_session(state, caller_session_key=slot_history_key(caller)))
+        if failure is RuntimeError:
+            assert exc.value.code == "agent_store_mismatch"
+        assert state.creator_slot_count(_MEMBER) == 0
+        assert published
+        assert all(keys == {caller.key} for keys in published)
