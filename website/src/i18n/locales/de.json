@@ -6315,6 +6315,7 @@
       "additions_other": "{{count}} Ergänzungen",
       "artifact": "Artefakt",
       "changed": "geändert",
+      "diff_unavailable_file_exceeds_snapshot_limit": "Diff nicht verfügbar: Die Datei ist zu groß für einen Vergleich (mehr als {{limit}} Zeichen).",
       "file_one": "{{count}} Datei",
       "file_other": "{{count}} Dateien",
       "large_file_change_region_view": "Große Datei — das Schattierungsband markiert den Bereich, nicht die genauen Zeilen",

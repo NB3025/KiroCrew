@@ -6217,6 +6217,7 @@
       "additions_other": "추가 {{count}}건",
       "artifact": "아티팩트",
       "changed": "변경됨",
+      "diff_unavailable_file_exceeds_snapshot_limit": "차이를 표시할 수 없습니다. 파일이 너무 커서 비교할 수 없습니다({{limit}}자 초과).",
       "file_other": "파일 {{count}}개",
       "large_file_change_region_view": "큰 파일 — 음영 띠는 영역을 표시하며 정확한 줄을 뜻하지 않습니다",
       "large_file_simplified_view": "큰 파일 — 간소화된 보기",

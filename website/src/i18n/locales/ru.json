@@ -6511,6 +6511,7 @@
       "additions_other": "{{count}} добавления",
       "artifact": "Артефакт",
       "changed": "изменено",
+      "diff_unavailable_file_exceeds_snapshot_limit": "Различия недоступны: файл слишком велик для сравнения (более {{limit}} символов).",
       "file_few": "{{count}} файла",
       "file_many": "{{count}} файлов",
       "file_one": "{{count}} файл",

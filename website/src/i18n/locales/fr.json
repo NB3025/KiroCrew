@@ -6413,6 +6413,7 @@
       "additions_other": "{{count}} ajouts",
       "artifact": "Artefact",
       "changed": "modifié",
+      "diff_unavailable_file_exceeds_snapshot_limit": "Diff indisponible : le fichier est trop volumineux pour être comparé (plus de {{limit}} caractères).",
       "file_many": "{{count}} fichiers",
       "file_one": "{{count}} fichier",
       "file_other": "{{count}} fichiers",

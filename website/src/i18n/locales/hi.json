@@ -6315,6 +6315,7 @@
       "additions_other": "{{count}} जोड़ी गई पंक्तियाँ",
       "artifact": "आर्टिफ़ैक्ट",
       "changed": "बदली गई",
+      "diff_unavailable_file_exceeds_snapshot_limit": "डिफ़ उपलब्ध नहीं है: तुलना के लिए फ़ाइल बहुत बड़ी है ({{limit}} वर्णों से अधिक)।",
       "file_one": "{{count}} फ़ाइल",
       "file_other": "{{count}} फ़ाइलें",
       "large_file_change_region_view": "बड़ी फ़ाइल — छायांकित पट्टी क्षेत्र दिखाती है, सटीक पंक्तियाँ नहीं",

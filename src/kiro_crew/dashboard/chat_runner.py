@@ -12,7 +12,7 @@ import stat as stat_module
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NamedTuple
 
 from kiro_crew import (
     mcp_apps_render,
@@ -1837,13 +1837,9 @@ _COMPACTION_FAILED_RETRIES = 2
 _COMPACT_FAIL_REASON_MAX_CHARS = 300
 
 
-def _truncate_snapshot(content: str) -> str:
-    """Cap content at _MAX_SNAPSHOT chars, appending a marker if truncated.
-    Shared by before-content (in _snapshot_write_target) and after-content
-    (in _flush_file_changes) so both paths show consistent diffs."""
-    if len(content) > _MAX_SNAPSHOT:
-        return content[:_MAX_SNAPSHOT] + f"\n... (truncated at {_MAX_SNAPSHOT} chars)"
-    return content
+class _Snapshot(NamedTuple):
+    content: str
+    truncated: bool
 
 
 # Bytes the snapshot read pulls before ``_truncate_snapshot`` caps it. A UTF-8
@@ -1855,8 +1851,16 @@ def _truncate_snapshot(content: str) -> str:
 _SNAPSHOT_READ_BYTES = 4 * _MAX_SNAPSHOT + 4
 
 
-def _safe_read_snapshot(path: str) -> str | None:
-    """Read a file's content for snapshot purposes, refusing sensitive paths.
+def _truncate_snapshot(content: str) -> _Snapshot:
+    """Cap content while reporting whether the configured limit was exceeded."""
+    if len(content) > _MAX_SNAPSHOT:
+        content = content[:_MAX_SNAPSHOT] + f"\n... (truncated at {_MAX_SNAPSHOT} chars)"
+        return _Snapshot(content, True)
+    return _Snapshot(content, False)
+
+
+def _safe_read_snapshot(path: str) -> _Snapshot | None:
+    """Read a file's content and truncation state, refusing sensitive paths.
 
     Reads through ``hooks.safe_read_file_bytes_nolink`` — the same descriptor
     gate the prompt and skill readers use — rather than validating the name and
@@ -2045,15 +2049,24 @@ def _snapshot_write_target(
     if cmd == "strReplace":
         before_full = _reconstruct_str_replace_before(path, raw_params)
         if before_full is not None:
-            return {"path": path, "content": _truncate_snapshot(before_full)}
+            before = _truncate_snapshot(before_full)
+            return {
+                "path": path,
+                "content": before.content,
+                "truncated": before.truncated,
+            }
 
     # Prefer authoritative content-block before-text when available.
     if diff_old_text is not None:
         # diff_old_text == "" means "file was created" (no previous content).
         # Apply truncation so content-block-sourced text obeys the same cap as
         # disk-sourced text (security + message-meta size invariant).
-        before = _truncate_snapshot(diff_old_text) if diff_old_text else ""
-        return {"path": path, "content": before}
+        before = _truncate_snapshot(diff_old_text)
+        return {
+            "path": path,
+            "content": before.content,
+            "truncated": before.truncated,
+        }
 
     # Fallback: read from disk (correct on the blocking permission-request path
     # where the write has NOT yet executed).
@@ -2062,8 +2075,12 @@ def _snapshot_write_target(
         # File doesn't exist yet (`create` on a new file is the common case)
         # OR was unreadable. Either way, record an empty before so the chip
         # still surfaces.
-        return {"path": path, "content": ""}
-    return {"path": path, "content": content}
+        return {"path": path, "content": "", "truncated": False}
+    return {
+        "path": path,
+        "content": content.content,
+        "truncated": content.truncated,
+    }
 
 
 def _flush_file_changes(slot: "_ChatSlot") -> None:
@@ -2084,17 +2101,28 @@ def _flush_file_changes(slot: "_ChatSlot") -> None:
         return
     # Dedup: keep first before for each path (truest "before") since a file
     # may be modified multiple times in one turn.
-    deduped: dict[str, dict[str, str]] = {}
+    deduped: dict[str, dict[str, Any]] = {}
     for fc in slot._file_changes:
         p = fc["path"]
         if p not in deduped:
-            deduped[p] = {"path": p, "before": fc["content"], "after": ""}
+            deduped[p] = {
+                "path": p,
+                "before": fc["content"],
+                "after": "",
+                "_before_truncated": bool(fc.get("truncated", False)),
+            }
     # Read after-content once per path. Uses _safe_read_snapshot so sensitive
     # paths and unreadable files yield empty after rather than crashing or
     # leaking credentials.
     for entry in deduped.values():
         after = _safe_read_snapshot(entry["path"])
-        entry["after"] = after if after is not None else ""
+        if after is None:
+            entry["after"] = ""
+            after = _Snapshot("", False)
+        else:
+            entry["after"] = after.content
+        if entry.pop("_before_truncated") or after.truncated:
+            entry.update(truncated=True, snapshot_limit_chars=_MAX_SNAPSHOT)
     # Scrub credentials and exfil URLs from path/before/after BEFORE attaching
     # to message meta. _save_slot_to_history runs _redact_meta on persist, but
     # the in-memory slot.messages reaches the dashboard UI via SSE/WS BEFORE

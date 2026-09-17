@@ -6217,6 +6217,7 @@
       "additions_other": "{{count}} 处新增",
       "artifact": "产物",
       "changed": "已更改",
+      "diff_unavailable_file_exceeds_snapshot_limit": "无法显示差异：文件过大，无法比较（超过 {{limit}} 个字符）。",
       "file_other": "{{count}} 个文件",
       "large_file_change_region_view": "大文件 — 阴影带标记区域，而非精确行",
       "large_file_simplified_view": "大文件 — 简化视图",
