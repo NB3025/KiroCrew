@@ -349,6 +349,11 @@ class FargateSigninHandle:
         self.url: str = ""
         self.code: str = ""
         self.ports: list = []
+        #: The Protocol's VERIFIED-refusal channel, empty here as a statement of
+        #: fact: this handle performs no sign-in, so it has nothing to refuse.
+        #: Present rather than left to ``getattr`` so a caller reading it
+        #: unconditionally cannot raise ``AttributeError`` on a Fargate launch.
+        self.error: str = ""
 
     def wait(self, cancel: threading.Event) -> bool:
         """Return immediately; there is no interactive step to wait for.

@@ -75,6 +75,22 @@ def _classify(sighting: TaskSighting) -> Ownership:
 
 # ── The Protocol seam ────────────────────────────────────────────────────────
 
+#: The ONLY ``(method, parameter)`` this engine may leave off ``LaunchEngine``.
+#:
+#: ``login_target`` is a keyword the Fargate engine deliberately does not take,
+#: and the runtime is built on that: ``_begin_signin_with_target`` calls the
+#: three-argument shape when it is absent, and ``_check_signin_target_supported``
+#: turns the absence into a PREFLIGHT refusal of an identity this engine cannot
+#: provide -- before anything is provisioned or billed. A Fargate container is
+#: handed its credential at run time and performs no interactive sign-in, so an
+#: engine that accepted the keyword without honouring it would sign the crew in
+#: as the wrong identity, which is the defect the keyword exists to close.
+#:
+#: Every other parameter is compared EXACTLY, this one included on the methods
+#: not named here. A new optional keyword therefore reds this test until someone
+#: decides, for that keyword, what was decided for this one.
+SUPPORTED_OMISSIONS = {("begin_signin", "login_target")}
+
 
 def test_engine_satisfies_the_launch_engine_protocol() -> None:
     """Structural conformance, checked by signature and not by duck-typing luck.
@@ -82,6 +98,11 @@ def test_engine_satisfies_the_launch_engine_protocol() -> None:
     ``LaunchEngine`` is a plain ``Protocol``, so a missing method or a renamed
     keyword is only discovered where the engine is called. Comparing signatures
     here makes that a test failure instead of a launch failure.
+
+    The comparison stays EXACT. The one parameter this engine is allowed to leave
+    out is named in :data:`SUPPORTED_OMISSIONS`, which carries the reason; every
+    other difference -- a missing method, a dropped parameter, a renamed one, an
+    extra one, a reordering -- still fails.
     """
     engine = FargateLaunchEngine()
     for name, expected in inspect.getmembers(LaunchEngine, inspect.isfunction):
@@ -89,11 +110,10 @@ def test_engine_satisfies_the_launch_engine_protocol() -> None:
             continue
         actual = getattr(engine, name, None)
         assert actual is not None, f"FargateLaunchEngine is missing {name}"
-        want = inspect.signature(expected)
-        got = inspect.signature(actual)
-        want_params = [p for p in want.parameters if p != "self"]
-        got_params = list(got.parameters)
-        assert got_params == want_params, f"{name}: {got_params} != {want_params}"
+        want_params = [p for p in inspect.signature(expected).parameters if p != "self"]
+        got_params = list(inspect.signature(actual).parameters)
+        allowed = [p for p in want_params if (name, p) not in SUPPORTED_OMISSIONS]
+        assert got_params in (want_params, allowed), f"{name}: {got_params} != {want_params}"
 
 
 def test_engine_is_injectable_where_the_ec2_engine_is() -> None:
@@ -123,9 +143,9 @@ def test_engine_is_injectable_where_the_ec2_engine_is() -> None:
 def test_signin_handle_has_every_signin_handle_protocol_member() -> None:
     """The handle carries every member ``SigninHandle`` declares, attributes included.
 
-    ``SigninHandle`` declares four ATTRIBUTES (``already_logged_in``, ``url``,
-    ``code``, ``ports``) beside its two methods, and ``run_launch`` reads
-    ``handle.already_logged_in`` unconditionally before anything else. A check
+    ``SigninHandle`` declares five ATTRIBUTES (``already_logged_in``, ``url``,
+    ``code``, ``ports``, ``error``) beside its two methods, and ``run_launch``
+    reads ``handle.already_logged_in`` unconditionally before anything else. A check
     written against the Protocol's ``def`` lines alone would pass a handle with
     no attributes at all, and that handle raises ``AttributeError`` on every
     launch. So the member set is taken from the Protocol's annotations AND its
@@ -138,7 +158,10 @@ def test_signin_handle_has_every_signin_handle_protocol_member() -> None:
     handle = FargateSigninHandle(task_arn=ARN)
     attributes = set(typing.get_type_hints(SigninHandle))
     methods = {n for n, _ in inspect.getmembers(SigninHandle, inspect.isfunction) if n[0] != "_"}
-    assert attributes == {"already_logged_in", "url", "code", "ports"}
+    # Pinned exactly, and moved to the Protocol's current shape rather than
+    # loosened: a member added upstream must red this test until someone adds it
+    # to the handle too, which is the whole point of the loop below.
+    assert attributes == {"already_logged_in", "url", "code", "ports", "error"}
     assert methods == {"wait", "close"}
     for name in attributes | methods:
         assert hasattr(handle, name), f"FargateSigninHandle is missing {name}"
