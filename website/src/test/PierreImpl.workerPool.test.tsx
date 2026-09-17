@@ -13,6 +13,7 @@ class FakeWorker {
   listeners = new Map<string, Set<(event: unknown) => void>>()
   sent: unknown[] = []
   terminated = false
+  postError: Error | undefined
 
   constructor(readonly url: URL, readonly options: WorkerOptions) {}
 
@@ -23,6 +24,7 @@ class FakeWorker {
   }
 
   postMessage(message: unknown) {
+    if (this.postError) throw this.postError
     this.sent.push(message)
   }
 
@@ -63,6 +65,7 @@ vi.mock('@pierre/diffs', () => ({
 /** Props the diff surface handed the library, so the plain-mode assertions can
  *  read the two things that make the saving real. */
 const diffProps = vi.hoisted(() => ({ last: undefined as Record<string, unknown> | undefined }))
+let consoleError = vi.fn()
 
 vi.mock('@pierre/diffs/react', async () => {
   const { createContext } = await import('react')
@@ -85,6 +88,8 @@ vi.mock('@pierre/diffs/react', async () => {
 beforeEach(() => {
   vi.useFakeTimers()
   vi.spyOn(console, 'warn').mockImplementation(() => {})
+  consoleError = vi.fn()
+  vi.spyOn(console, 'error').mockImplementation(consoleError)
   vi.resetModules()
   vi.stubGlobal('Worker', FakeWorker)
   state.poolCalls.length = 0
@@ -131,6 +136,56 @@ async function failPoolToUnavailable() {
 }
 
 describe('Pierre highlight worker pool recovery', () => {
+  it('classifies worker error events', async () => {
+    const { createMonitoredWorker } = await loadPierre()
+    const reportFailure = vi.fn()
+    const worker = createMonitoredWorker(reportFailure) as unknown as FakeWorker
+
+    worker.emit('error', { message: 'worker failed' })
+
+    expect(reportFailure).toHaveBeenCalledWith({ classification: 'error', message: 'worker failed' })
+  })
+
+  it('classifies worker messageerror events', async () => {
+    const { createMonitoredWorker } = await loadPierre()
+    const reportFailure = vi.fn()
+    const worker = createMonitoredWorker(reportFailure) as unknown as FakeWorker
+
+    worker.emit('messageerror', {})
+
+    expect(reportFailure).toHaveBeenCalledWith({
+      classification: 'messageerror',
+      message: 'worker message could not be deserialized',
+    })
+  })
+
+  it('classifies a throwing postMessage', async () => {
+    const { createMonitoredWorker } = await loadPierre()
+    const reportFailure = vi.fn()
+    const worker = createMonitoredWorker(reportFailure) as unknown as FakeWorker
+    worker.postError = new Error('DataCloneError')
+
+    expect(() => worker.postMessage({ type: 'file', id: 'clone-failed' })).toThrow('DataCloneError')
+    expect(reportFailure).toHaveBeenCalledWith({
+      classification: 'postMessage throw',
+      message: 'DataCloneError',
+    })
+  })
+
+  it('classifies an initialization watchdog timeout', async () => {
+    const { createMonitoredWorker } = await loadPierre()
+    const reportFailure = vi.fn()
+    const worker = createMonitoredWorker(reportFailure) as unknown as FakeWorker
+
+    worker.postMessage({ type: 'initialize', id: 'slow-initialize' })
+    await vi.advanceTimersByTimeAsync(120_000)
+
+    expect(reportFailure).toHaveBeenCalledWith({
+      classification: 'init timeout',
+      message: 'worker request slow-initialize (initialize) timed out',
+    })
+  })
+
   it('versions the worker URL so pre-WASM response headers cannot survive an upgrade', async () => {
     await startPool()
     expect(state.managers[0].workers.length).toBeGreaterThan(0)
@@ -179,7 +234,12 @@ describe('Pierre highlight worker pool recovery', () => {
     expect(view.container).toContainElement(alert)
     expect(alert).not.toHaveClass('fixed')
     expect(alert).toHaveTextContent(
-      'Syntax highlighting is unavailable until you reload. Content remains readable.',
+      'Syntax highlighting is unavailable until you reload. Content remains readable. '
+      + 'Last failure: error (generation 4, attempt 4): half-open failed',
+    )
+    expect(consoleError).toHaveBeenCalledOnce()
+    expect(consoleError).toHaveBeenCalledWith(
+      '[pierre-worker-pool] unavailable classification=error generation=4 attempt=4 reason="half-open failed"',
     )
     const reload = view.getByRole('button', { name: 'Reload' })
     expect(reload).toBeInTheDocument()

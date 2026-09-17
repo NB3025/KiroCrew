@@ -7156,6 +7156,7 @@
       "highlighting_restarting_editing_available": "हाइलाइटिंग फिर से शुरू हो रही है। संपादन जारी रखा जा सकता है।",
       "highlighting_starting_editing_available": "सिंटैक्स हाइलाइटिंग शुरू हो रही है। संपादन जारी रखा जा सकता है।",
       "highlighting_unavailable_content_readable_reload": "पुनः लोड करने तक सिंटैक्स हाइलाइटिंग उपलब्ध नहीं है। सामग्री पढ़ी जा सकती है।",
+      "highlighting_unavailable_with_reason": "पुनः लोड करने तक सिंटैक्स हाइलाइटिंग उपलब्ध नहीं है। सामग्री पढ़ी जा सकती है। अंतिम विफलता: {{classification}} (जनरेशन {{generation}}, प्रयास {{attempt}}): {{reason}}",
       "highlighting_unavailable_reload": "सिंटैक्स हाइलाइटिंग उपलब्ध नहीं है। अपना ड्राफ़्ट सहेजें या कॉपी करें, फिर इसे बहाल करने के लिए पुनः लोड करें; संपादन जारी रखा जा सकता है।"
     },
     "projectPicker": {

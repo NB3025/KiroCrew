@@ -7261,6 +7261,7 @@
       "highlighting_restarting_editing_available": "O realce está reiniciando. Você pode continuar editando.",
       "highlighting_starting_editing_available": "O realce de sintaxe está iniciando. Você pode continuar editando.",
       "highlighting_unavailable_content_readable_reload": "O realce de sintaxe ficará indisponível até você recarregar. O conteúdo continua legível.",
+      "highlighting_unavailable_with_reason": "O realce de sintaxe ficará indisponível até você recarregar. O conteúdo continua legível. Última falha: {{classification}} (geração {{generation}}, tentativa {{attempt}}): {{reason}}",
       "highlighting_unavailable_reload": "O realce de sintaxe está indisponível. Salve ou copie seu rascunho e recarregue para restaurá-lo; você pode continuar editando."
     },
     "projectPicker": {
