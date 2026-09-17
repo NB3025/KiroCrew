@@ -4833,12 +4833,38 @@ def _private_memory_scan_failure(
     )
 
 
-def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = None) -> None:
-    """A path mask cannot hide another name for the same protected inode."""
+def _private_memory_entry_vanished(exc: OSError) -> bool:
+    """A listed entry that disappeared before it could be examined.
+
+    Only the two codes the OS raises for a removed name or a removed parent
+    qualify; every other failure keeps the scan fail-closed.
+    """
+    return exc.errno in (errno.ENOENT, errno.ENOTDIR)
+
+
+_PRIVATE_MEMORY_SCAN_ATTEMPTS = 5
+
+
+class _PrivateMemoryEntryVanished(Exception):
+    """Abort one scan pass when a listed entry vanishes."""
+
+    def __init__(
+        self,
+        operation: Literal["entry_stat", "entry_iterdir"],
+        tree: Literal["root_tmp", "sessions", "snapshots", "memory"],
+        cause: OSError,
+    ) -> None:
+        super().__init__(operation)
+        self.operation = operation
+        self.tree = tree
+        self.cause = cause
+
+
+def _scan_private_memory_hardlinks_once(layout: _PrivateMemoryLayout) -> None:
+    """Reject aliases in one pass, aborting if a listed entry vanishes."""
     remaining = 100_000
     visited: set[tuple[int, int]] = set()
     pending = []
-    layout = layout or _private_memory_layout()
     for root_name in dict.fromkeys((*layout.homes, *layout.workspaces)):
         root = Path(root_name)
         try:
@@ -4884,6 +4910,8 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
         try:
             info = path.stat()
         except OSError as exc:
+            if _private_memory_entry_vanished(exc):
+                raise _PrivateMemoryEntryVanished("entry_stat", tree, exc) from exc
             raise _private_memory_scan_failure("entry_stat", tree, exc) from exc
         inode = (info.st_dev, info.st_ino)
         if inode in visited:
@@ -4898,7 +4926,25 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
             try:
                 pending.extend((entry, tree) for entry in path.iterdir())
             except OSError as exc:
+                if _private_memory_entry_vanished(exc):
+                    raise _PrivateMemoryEntryVanished("entry_iterdir", tree, exc) from exc
                 raise _private_memory_scan_failure("entry_iterdir", tree, exc) from exc
+
+
+def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = None) -> None:
+    """A path mask cannot hide another name for the same protected inode."""
+    resolved_layout = layout or _private_memory_layout()
+    last_vanished: _PrivateMemoryEntryVanished | None = None
+    for _ in range(_PRIVATE_MEMORY_SCAN_ATTEMPTS):
+        try:
+            _scan_private_memory_hardlinks_once(resolved_layout)
+            return
+        except _PrivateMemoryEntryVanished as exc:
+            last_vanished = exc
+    assert last_vanished is not None
+    raise _private_memory_scan_failure(
+        last_vanished.operation, last_vanished.tree, last_vanished.cause
+    ) from last_vanished.cause
 
 
 def _prepare_private_log_dir(layout: _PrivateMemoryLayout | None = None) -> str:

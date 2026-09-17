@@ -230,8 +230,14 @@ snapshots can contain Global memory, and transcripts can contain other members'
 context. Gateway-owned history APIs remain outside that filesystem view. Before
 private launch on either OS, a bounded scan of the reserved memory-bearing
 source trees refuses hardlinked files, since a path mask cannot hide another
-name for their inode. It does not scan project trees. Scan I/O failures still
-refuse launch and retain their original exception cause. Their bounded outer
+name for their inode. It does not scan project trees. An entry the listing
+returned but the OS then reports as gone (`ENOENT`, or `ENOTDIR` for a vanished
+parent) at the `entry_stat` or `entry_iterdir` step aborts that pass and restarts
+the scan from the root, in every tree. Launch proceeds only after one pass
+completes without a vanished entry. After five aborted attempts, launch refuses
+with the last `entry_stat` or `entry_iterdir` diagnostic and its original cause.
+Every other scan I/O failure still refuses launch immediately and retains its
+original exception cause. Their bounded outer
 error preserves the `memory_unavailable: cannot verify protected memory hardlinks`
 prefix and reports only a fixed operation (`root_iterdir`, `entry_stat`, or
 `entry_iterdir`), tree category (`root_tmp`, `sessions`, `snapshots`, or `memory`),
@@ -239,8 +245,8 @@ and available unsigned 32-bit integer `errno`/`winerror` values. Root enumeratio
 uses the aggregate `memory` category; descendants retain their selected tree's
 category. These fields survive workflow error serialization without exposing
 paths, filenames, exception messages, or private content. Required-root remedies,
-hardlink rejection, scan selection and limits are unchanged; diagnostics neither
-retry nor skip failed I/O. The Linux canary checks
+hardlink rejection, scan selection and limits are unchanged; only the two
+vanished-entry codes named above restart a pass. The Linux canary checks
 that `/proc` root/cwd/fd aliases cannot cross the launcher's user-namespace
 boundary; runtime evidence still comes from CI, not profile-string inspection.
 
