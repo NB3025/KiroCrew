@@ -348,8 +348,10 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 },
                 status=409,
             )
-        # Busy check — prevent concurrent writes to same slot
-        if slot.task is not None and not slot.task.done():
+        # Busy check — prevent concurrent writes to the same slot. ``running``
+        # includes the outer Autopilot controller while no child turn occupies
+        # ``slot.task``, so stage settlement cannot admit an unrelated request.
+        if slot.running:
             sel().log_api_access(
                 caller=request.remote or "",
                 operation="openai_compat.chat",
