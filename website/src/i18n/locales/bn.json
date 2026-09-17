@@ -12984,7 +12984,11 @@
         "auto_download_save_failed": "স্বয়ংক্রিয় ডাউনলোড সেটিং সংরক্ষণ করা যায়নি।",
         "auto_update_setting_unavailable": "স্বয়ংক্রিয়-আপডেট সেটিং লোড করা যায়নি। লোড হওয়া পর্যন্ত সুইচটি ডিফল্ট দেখাবে।",
         "copy_failed_select_the_command_and_copy_it_manually": "কপি করা যায়নি। কমান্ডটি সিলেক্ট করে নিজে কপি করো।",
-        "update_info_unavailable": "অ্যাপ থেকে এই বিল্ডের সংস্করণ ও আপডেট চ্যানেল পড়া যায়নি।"
+        "update_info_unavailable": "অ্যাপ থেকে এই বিল্ডের সংস্করণ ও আপডেট চ্যানেল পড়া যায়নি।",
+        "app_lane_label": "অ্যাপ",
+        "app_lane_title": "ইনস্টল করা ডেস্কটপ অ্যাপ",
+        "gateway_lane_label": "গেটওয়ে",
+        "gateway_lane_title": "এই ড্যাশবোর্ড যে গেটওয়ের সাথে যুক্ত"
       },
       "botChannelPanel": {
         "allowed_user_ids": "অনুমোদিত ইউজার ID",

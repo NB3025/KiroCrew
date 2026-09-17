@@ -12800,7 +12800,11 @@
         "auto_download_save_failed": "자동 다운로드 설정을 저장할 수 없습니다.",
         "auto_update_setting_unavailable": "자동 업데이트 설정을 불러올 수 없습니다. 불러올 때까지 스위치는 기본값을 표시합니다.",
         "copy_failed_select_the_command_and_copy_it_manually": "복사에 실패했습니다. 명령을 선택하여 직접 복사하세요.",
-        "update_info_unavailable": "앱에서 이 빌드의 버전과 업데이트 채널을 읽을 수 없습니다."
+        "update_info_unavailable": "앱에서 이 빌드의 버전과 업데이트 채널을 읽을 수 없습니다.",
+        "app_lane_label": "앱",
+        "app_lane_title": "설치된 데스크톱 앱",
+        "gateway_lane_label": "게이트웨이",
+        "gateway_lane_title": "이 대시보드가 연결된 게이트웨이"
       },
       "botChannelPanel": {
         "allowed_user_ids": "허용된 사용자 ID",
