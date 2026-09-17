@@ -336,12 +336,13 @@ class FargateSigninHandle:
     present key is not a working one and that validity "can only be established by
     a real turn", so this handle must not be read as evidence the credential works.
 
-    ``run_launch`` reads ``already_logged_in`` first and unconditionally, and takes
-    the already-signed-in branch when it is true: that branch marks the step done
-    without ever showing a prompt, which is exactly the right path for a container
+    ``run_launch`` reads ``error`` first and ``already_logged_in`` next, and with an
+    empty ``error`` it takes the already-signed-in branch: that branch marks the step
+    done without ever showing a prompt, which is exactly the right path for a container
     that is handed its credential at run time. So ``already_logged_in`` is ``True``
     as a statement of fact, and ``url``, ``code`` and ``ports`` are empty because
-    there is no prompt to show.
+    there is no prompt to show. Reading the order the other way round would describe a
+    handle whose refusal is ignored.
     """
 
     def __init__(self, task_arn: str) -> None:

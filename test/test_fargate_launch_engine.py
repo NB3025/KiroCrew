@@ -666,7 +666,7 @@ class _DecliningEngine:
     def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str:
         return ARN
 
-    def begin_signin(self, *, instance_id: str, profile: str, region: str):
+    def begin_signin(self, *, instance_id: str, profile: str, region: str, login_target=None):
         return FargateSigninHandle(task_arn=instance_id)
 
     def register(self, *, instance_id: str, tag: str, profile: str, region: str) -> None:
@@ -1004,7 +1004,7 @@ class _Ec2ShapedEngine:
     def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str:
         return ARN
 
-    def begin_signin(self, *, instance_id: str, profile: str, region: str):
+    def begin_signin(self, *, instance_id: str, profile: str, region: str, login_target=None):
         return FargateSigninHandle(task_arn=instance_id)
 
     def register(self, *, instance_id: str, tag: str, profile: str, region: str) -> None:
