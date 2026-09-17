@@ -2151,6 +2151,10 @@ class _ChatSlot:
         "_refusal_replay_queue_id",
         "_refusal_replay_stop_gen",
         "_refusal_replay_session_stop_gen",
+        "_binding_replay_queue_id",
+        "_binding_replay_session_key",
+        "_binding_replay_stop_gen",
+        "_binding_replay_session_stop_gen",
         "_posttoken_retry_used",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
@@ -2660,6 +2664,14 @@ class _ChatSlot:
         self._refusal_replay_queue_id: str = ""
         self._refusal_replay_stop_gen: int = 0
         self._refusal_replay_session_stop_gen: int = 0
+        # Preserved-thinking binding recovery replays the user's own text, so it
+        # needs an id-based dispatch guard just like refusal replay. These
+        # snapshots ensure a Stop, correction, or session rebind that lands while
+        # native-conversation teardown awaits can purge the queued retry.
+        self._binding_replay_queue_id: str = ""
+        self._binding_replay_session_key: str = ""
+        self._binding_replay_stop_gen: int = 0
+        self._binding_replay_session_stop_gen: int = 0
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
