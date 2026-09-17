@@ -115,6 +115,12 @@ Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line i
 
 ### MCP chat-history tools (`mcp_core.py`)
 
+The private-member relay (`POST /api/sessions/member-history`) validates each
+operation's arguments with the same `MCP_CORE_SCHEMAS` entry and
+`validate_tool_args` as the in-process tools. Invalid operations or arguments
+return HTTP 400 before rendering; validated defaults and cleaned values reach
+the member-scoped core.
+
 These read-only tools expose the session store to the agent and are all
 workspace-scoped by default (fail-closed via `_caller_workspace`/`_ws_bucket`,
 `all_workspaces` opts out), exclude incognito/temporary sessions (canonical

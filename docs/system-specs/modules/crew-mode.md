@@ -5,6 +5,12 @@ agent template plus a workspace, a memory store, a model and a reasoning effort,
 and it carries free-text `triggers` that decide whether the orchestrator may
 route work to it. The selection path is the `select_crew` MCP tool.
 
+The selection activity log resolves transcript metadata with
+`get_metadata_status()`: unreadable metadata uses `incognito` for both Global
+and bound-member callers. Readable Global headers without `memory_mode` retain
+the legacy `persistent` default; bound members without an explicit mode use
+`incognito`, including when a hidden transcript appears readable but empty.
+
 This spec used to own a second thing spelled *crew*: **Crew Mode**, the
 `"crew"` chat-slot mode whose control plane (`crew_chat.py`) fanned one
 session's topics out to sub-sessions. It is retired — see
