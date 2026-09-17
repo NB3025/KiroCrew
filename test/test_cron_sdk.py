@@ -696,11 +696,28 @@ class TestOwnedCronToggle:
         with pytest.raises(PermissionError):
             await CronSDK("other", service).set_enabled_async(job.id, True)
 
-    def test_enabled_update_is_not_silently_ignored(self, service):
+    @pytest.mark.parametrize("field,value", [("enabled", False), ("user_paused", True)])
+    def test_pause_update_is_not_silently_ignored(self, service, field, value):
         sdk = CronSDK("example", service)
         job = sdk.add_job(name="example/job", message="hello", every_secs=600)
+        before = service._path.read_bytes()
         with pytest.raises(ValueError, match="set_enabled"):
-            sdk.update_job(job.id, enabled=False)
+            sdk.update_job(job.id, message="changed", **{field: value})
+        assert service._path.read_bytes() == before
+        assert job.message == "hello"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field,value", [("enabled", False), ("user_paused", True)])
+    async def test_async_pause_update_is_not_silently_ignored(self, service, field, value):
+        import asyncio
+
+        sdk = CronSDK("example", service)
+        job = await sdk.add_job_async(name="example/job", message="hello", every_secs=600)
+        before = await asyncio.to_thread(service._path.read_bytes)
+        with pytest.raises(ValueError, match="set_enabled"):
+            await sdk.update_job_async(job.id, message="changed", **{field: value})
+        assert await asyncio.to_thread(service._path.read_bytes) == before
+        assert job.message == "hello"
 
     @pytest.mark.parametrize("value", ["false", 0, 1, None])
     def test_toggle_requires_boolean(self, service, value):

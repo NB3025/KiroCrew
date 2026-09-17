@@ -28,7 +28,8 @@ not expire a claimed message; failure shows only the existing session-open error
 and never sends to a fallback. A routed chat waits for that exact target before
 using the message; an embedded chat never consumes the dashboard intent.
 `autoSend: false` seeds
-an unsent draft. Without a target, the existing new-session controller creates
+an unsent draft, appending to existing text when the target already has a draft.
+Without a target, the existing new-session controller creates
 one session and stages the draft before navigation, retaining it on creation
 failure for retry. Agent selection applies to new sessions only. These options
 do not attach app task metadata or change backend session authorization.

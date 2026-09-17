@@ -63,6 +63,8 @@ a new draft session through the existing session controller. With `slotKey`, the
 routed chat activates that exact slot on cold entry and hot navigation before
 filling or sending. The controller retains a claimed message through slow
 activation; a rejected switch reports failure without sending to another slot.
+A targeted draft appends to any unsent text through the shared draft merge helper,
+persists the merged text, and leaves no second prefill to overwrite it on return.
 An existing slot retains its agent. Embedded chat surfaces never consume the
 dashboard's launch intent. Repeated rendering of a `new=1` navigation consumes
 that new-session request once, including while creation is pending. A failed
@@ -73,8 +75,9 @@ No task-binding metadata or session-authority grant is introduced.
 service's pause/resume transition, preserving the job ID and history. The service
 checks the expected app owner inside its lock after reloading persisted state;
 missing and foreign jobs are refused and the SDK audits ownership denial.
-Sync calls refuse on a running event loop. `update_job(enabled=...)` refuses
-explicitly instead of silently ignoring the toggle. Existing app cron permission
+Sync calls refuse on a running event loop. `update_job` refuses both `enabled`
+and `user_paused` updates explicitly instead of silently ignoring a toggle.
+Callers use the scoped transition method rather than assigning pause fields. Existing app cron permission
 and runtime execution checks remain required.
 
 ## App Store source selection

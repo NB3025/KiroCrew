@@ -237,7 +237,8 @@ these helpers share locale selection and formatting, not permission to modify
 the dashboard's catalogs.
 
 For chat handoff, `openChat({ message, autoSend: false })` creates an unsent
-draft in a new session. Add `slotKey` to target an existing session. Omit
+draft in a new session. Add `slotKey` to target an existing session; a draft
+launch appends to that session's unsent text. Omit
 `autoSend` to send automatically; without `slotKey` this starts a new session.
 `agent` applies only to new sessions. A target must activate successfully before
 its message is used; the SDK does not select another session on failure.
@@ -245,8 +246,8 @@ its message is used; the SDK does not select another session on failure.
 For Python app hooks with an existing cron grant, use
 `await ctx.cron.set_enabled_async(job_id, False)` to pause an owned job, or
 `True` to resume it without replacing its ID. Use `set_enabled` off-loop.
-`update_job` and `update_job_async` reject an `enabled` argument; use the toggle
-methods instead. Foreign and missing job IDs are refused.
+`update_job` and `update_job_async` reject `enabled` and `user_paused` arguments;
+use the toggle methods instead. Foreign and missing job IDs are refused.
 
 ## Shared React Query
 

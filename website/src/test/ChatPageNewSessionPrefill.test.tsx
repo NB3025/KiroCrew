@@ -30,6 +30,7 @@ import chatReducer, { switchSlot } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { PREFILL_STORAGE_KEY } from '../utils/navIntent'
+import { DRAFTS_KEY, saveDrafts, setDraft, __resetForTests as resetDrafts } from '../utils/chatDrafts'
 
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -85,14 +86,14 @@ const NEW_SLOT = 'chat-new-1'
 
 /** `activeSlot: null` with one known session — the state a cold `/chat?new=1`
  *  load lands in, and the one where a spurious create would be visible. */
-function makeStore() {
+function makeStore(targetTitle?: string) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
       dashboard: {
         status: null, connected: true, slotsLoaded: true,
         slots: [
-          { key: 'chat-other', messages: 2, running: false, mode: '', pending_approval: false, waiting_for_input: false },
+          { key: 'chat-other', title: targetTitle, messages: 2, running: false, mode: '', pending_approval: false, waiting_for_input: false },
           { key: 'chat-old', messages: 3, running: false, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined },
         ],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
@@ -121,8 +122,8 @@ function NavigationProbe() {
   return null
 }
 
-async function renderAt(route: string) {
-  const store = makeStore()
+async function renderAt(route: string, targetTitle?: string) {
+  const store = makeStore(targetTitle)
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   await act(async () => {
     render(
@@ -144,6 +145,7 @@ beforeEach(() => {
   delete (window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch
   sessionStorage.clear()
   localStorage.clear()
+  resetDrafts()
   createChatSlot.mockReset()
   chatSlotDetail.mockReset()
   chatSlotDetail.mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 })
@@ -207,6 +209,32 @@ describe('App SDK chat launch intent', () => {
     const store = await renderAt('/chat?sid=chat-old')
     await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-old'))
     await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it.each(['cold', 'hot'])('preserves an existing draft on a %s targeted draft launch', async (entry) => {
+    const existing = 'Keep my unsent notes  '
+    const merged = `${existing}\n\n${PROMPT}`
+    const drafts: Record<string, string> = {}
+    setDraft(drafts, 'chat-other', existing)
+    saveDrafts(drafts)
+    let store: ReturnType<typeof makeStore>
+    if (entry === 'cold') {
+      launch({ message: PROMPT, slotKey: 'chat-other', autoSend: false })
+      store = await renderAt('/chat?sid=chat-other')
+    } else {
+      store = await renderAt('/chat?sid=chat-old')
+      await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+      launch({ message: PROMPT, slotKey: 'chat-other', autoSend: false })
+      await act(async () => { navigateInTest('/chat?sid=chat-other') })
+    }
+    await waitFor(() => expect(composer().value).toBe(merged))
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(DRAFTS_KEY) ?? '{}')['chat-other']).toBe(merged))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+    await act(async () => { await store.dispatch(switchSlot('chat-old')) })
+    await act(async () => { await store.dispatch(switchSlot('chat-other')) })
+    await waitFor(() => expect(composer().value).toBe(merged))
     expect(sendChat).not.toHaveBeenCalled()
     expect(createChatSlot).not.toHaveBeenCalled()
   })
@@ -329,13 +357,18 @@ describe('App SDK chat launch intent', () => {
     if (autoSend) expect(sendChat.mock.calls[0]).toContain(PROMPT)
   })
 
-  it.each([404, 500])('shows failed target activation without sending (HTTP %s)', async (status) => {
-    const store = await renderAt('/chat?sid=chat-old')
+  it.each([
+    { status: 404, title: undefined },
+    { status: 500, title: undefined },
+    { status: 404, title: 'Saved notes' },
+    { status: 500, title: 'Saved notes' },
+  ])('shows failed target activation without sending (HTTP $status, title=$title)', async ({ status, title }) => {
+    const store = await renderAt('/chat?sid=chat-old', title)
     await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
     chatSlotDetail.mockRejectedValueOnce(Object.assign(new Error('target load failed'), { status }))
     launch({ message: PROMPT, slotKey: 'chat-other' })
     await act(async () => { navigateInTest('/chat?sid=chat-other') })
-    await waitFor(() => expect(screen.getByText('Couldn\'t open "chat-other". Try again.')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(`Couldn't open "${title || 'chat-other'}". Try again.`)).toBeTruthy())
     expect(store.getState().chat.switchSlotGone).toBeNull()
     expect(sendChat).not.toHaveBeenCalled()
     expect(createChatSlot).not.toHaveBeenCalled()

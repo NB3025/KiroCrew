@@ -2189,10 +2189,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!intent.message) return
     if (intent.autoSend === false && activeSlot) {
       newSessionRef.current = false
-      writePrefill(activeSlot, intent.message)
-      setDraft(drafts.current, activeSlot, intent.message)
+      const merged = mergeIntoDraft(drafts.current[activeSlot], intent.message)
+      setDraft(drafts.current, activeSlot, merged)
       saveDraftsDebounced()
-      setInput(intent.message)
+      setInput(merged)
       raisePrefillHint()
     } else {
       autoSendRef.current = intent.message

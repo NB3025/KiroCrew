@@ -314,10 +314,11 @@ export function useChatPageSessionController({
       if (switchSlot.fulfilled.match(result)) {
         setAppSlotLaunch(intent)
       } else {
-        setSidError(i18nT('pages.chatPage.could_not_open_this_session', { title: intent.slotKey }))
+        const title = filteredSlots.find(slot => slot.key === intent.slotKey)?.title || intent.slotKey
+        setSidError(i18nT('pages.chatPage.could_not_open_this_session', { title }))
       }
     })
-  }, [connected, dispatch, embedded, locationKey, searchParams])
+  }, [connected, dispatch, embedded, filteredSlots, locationKey, searchParams])
 
   // ?new=1: create a blank slot for an embed or a fresh desktop window.
   const newSlotMutation = useMutation({
