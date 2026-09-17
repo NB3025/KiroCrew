@@ -139,6 +139,60 @@ class TestRunSnapshotBackup:
                 )
         put_file.assert_not_called()
 
+    def test_a_partial_bundle_is_uploaded_when_it_is_all_there_is(self, caplog):
+        # `snapshot` names a bundle kirocrew-partial-* when it could not READ something it
+        # was asked to carry. Globbing only the complete name made that "produced no
+        # archive" -- nothing uploaded, in exactly the case where holding a copy matters.
+        def fake_snapshot(argv):
+            archive = Path(argv[0]) / "kirocrew-partial-20260101T000000Z.tar.gz"
+            with tarfile.open(archive, "w:gz"):
+                pass
+            return 0
+
+        with (
+            mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
+            mock.patch.object(backup, "_authorize_upload"),
+            mock.patch.object(backup.storage, "put_file") as put_file,
+            caplog.at_level(logging.WARNING),
+        ):
+            backup.run_snapshot_backup(ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER)
+
+        assert put_file.call_args_list, "the partial bundle was not uploaded"
+        # And the operator is told which kind left, since a partial is second choice.
+        assert any("PARTIAL" in r.message or "PARTIAL" in r.getMessage() for r in caplog.records)
+
+    def test_a_complete_bundle_wins_when_both_are_present(self, caplog):
+        # Second choice means second: with both kinds in the directory the complete one is
+        # pushed, and the partial notice is not printed.
+        def fake_snapshot(argv):
+            out_dir = Path(argv[0])
+            for stem in (
+                "kirocrew-partial-20260101T000000Z",
+                "kirocrew-snapshot-20260101T000001Z",
+            ):
+                with tarfile.open(out_dir / f"{stem}.tar.gz", "w:gz"):
+                    pass
+            return 0
+
+        with (
+            mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
+            mock.patch.object(backup, "_authorize_upload"),
+            mock.patch.object(backup.storage, "put_file") as put_file,
+            caplog.at_level(logging.WARNING),
+        ):
+            backup.run_snapshot_backup(ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER)
+
+        # WHICH file left, not merely that one did: preferring the partial also uploads
+        # something and also prints no notice, so only the local path discriminates.
+        uploaded = [
+            Path(call.kwargs.get("local_path") or call.args[5]).name
+            for call in put_file.call_args_list
+            if str(call).endswith(".tar.gz')") or ".tar.gz" in str(call)
+        ]
+        assert any(n.startswith("kirocrew-snapshot-") for n in uploaded), uploaded
+        assert not any(n.startswith("kirocrew-partial-") for n in uploaded), uploaded
+        assert not any("PARTIAL" in r.getMessage() for r in caplog.records)
+
     def test_snapshot_success_pushes_entropy_keyed_archive_and_records_run(self):
         # The engine names by second-resolution timestamp; the PUSHED key must
         # carry its own entropy (the _stamp shape) so a racing pair cannot

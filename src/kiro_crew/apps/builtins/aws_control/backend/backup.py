@@ -67,7 +67,7 @@ from kiro_crew.history import SESSIONS_DIR_NAME
 from kiro_crew.platform_compat import file_lock, is_link_or_junction, open_lock_file
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.snapshot import snapshot_main
+from kiro_crew.snapshot import PARTIAL_PREFIX, SNAPSHOT_PREFIX, snapshot_main
 
 logger = logging.getLogger(__name__)
 
@@ -1109,10 +1109,22 @@ def run_snapshot_backup(
         rc = snapshot_main([tmp, "--keep", "1"])
         if rc != 0:
             raise RuntimeError(f"snapshot build failed (rc={rc})")
-        archives = sorted(Path(tmp).glob("kirocrew-snapshot-*.tar.gz"))
-        if not archives:
+        # Both bundle kinds, complete PREFERRED. `snapshot` names a bundle
+        # `kirocrew-partial-*` when it could not read something it was asked to carry,
+        # and globbing only the complete name made that an upload failure -- the backup
+        # sent nothing at all in exactly the case where having a copy matters. A partial
+        # bundle is worth uploading; it is just second choice, and the operator should
+        # be told which one left.
+        complete = sorted(Path(tmp).glob(f"{SNAPSHOT_PREFIX}*.tar.gz"))
+        partial = sorted(Path(tmp).glob(f"{PARTIAL_PREFIX}*.tar.gz"))
+        if not complete and not partial:
             raise RuntimeError("snapshot build produced no archive")
-        archive = archives[-1]
+        archive = complete[-1] if complete else partial[-1]
+        if not complete:
+            logger.warning(
+                "aws-control: uploading a PARTIAL snapshot (%s) -- entries this host could not read were skipped and are listed in the bundle's MANIFEST.json",
+                archive.name,
+            )
         # The bytes that LEAVE are redacted when the operator has opted in; the local
         # bundle is never touched. This is the one part of an off-host backup the app does
         # not own: the bucket, its hardening, the consent grant and the transport are all
