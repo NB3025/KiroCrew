@@ -821,14 +821,19 @@ def _pid_exited_but_unreaped(pid: int) -> bool:
     handed to an unrelated new leader. So the escalation has to be able to say
     "the root has exited" without also making its pgid ambiguous.
 
-    Conservative on an unreadable stat: returns False, i.e. "still running", so
-    a caller waits out its grace rather than exiting early on a guess. Off Linux
-    there is no zombie state to read, so this falls back to plain liveness --
-    which on macOS still feeds a real group escalation (``_isolated_provider_group``
-    resolves a pgid there too), so the fallback is a loss of precision, not a
-    disabled path: an exited-but-unreaped root simply reads as alive and the
-    caller waits out the grace instead of exiting early.
+    Conservative on an unreadable state: returns False, i.e. "still running", so
+    a caller waits out its grace rather than exiting early on a guess. On macOS
+    the state comes from ``sysctl KERN_PROC_PID``, which lists zombies where
+    libproc refuses them; a liveness probe would not do, because a zombie
+    answers ``kill(pid, 0)`` as present and the root would read as running until
+    someone else reaped it -- which this teardown deliberately does not, until
+    the last group signal is sent. On other non-Linux platforms there is no
+    zombie state to read, so this falls back to plain liveness: an
+    exited-but-unreaped root reads as alive and the caller waits out the grace.
     """
+    if sys.platform == "darwin":
+        zombie = platform_compat.darwin_pid_is_zombie(pid)
+        return bool(zombie) if zombie is not None else False
     if sys.platform != "linux":
         return not platform_compat.pid_exists(pid)
     try:
@@ -859,7 +864,17 @@ def _pgroup_has_member_besides(pgid: int, root_pid: int) -> bool:
     Conservative on a scan failure: returns True, i.e. "assume the group still
     holds something", so the caller escalates rather than declaring the tree
     gone on unread evidence.
+
+    macOS lists the group with ``sysctl KERN_PROC_PGRP`` and applies the same
+    rule -- a zombie member is not holding the group open. Other non-Linux
+    platforms can only ask whether the group exists, which a retained zombie
+    leader keeps answering yes to, so there the caller waits out its grace.
     """
+    if sys.platform == "darwin":
+        members = platform_compat.darwin_pgroup_members(pgid)
+        if members is None:
+            return True
+        return any(m.pid != root_pid and not m.zombie for m in members)
     if sys.platform != "linux":
         return platform_compat.pgroup_exists(pgid)
     try:
