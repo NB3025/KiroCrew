@@ -61,7 +61,8 @@ import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { markSlotRead } from '../../store/dashboardSlice'
-import { emitSlotRead } from '../../lib/slotReadRelay'
+import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
+import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import ChatPane from '../../components/ChatPane'
@@ -1014,12 +1015,19 @@ export default function MembersPage() {
 
   // Mounting a member thread IS reading it, but nothing on this page moves
   // `chat.activeSlot` (that transition belongs to the Sessions page's
-  // switchSlot, the only other markSlotRead caller), so the websocket
-  // unread-marker keeps flagging this slot even while the user is looking at
-  // it. Drain it here instead: once when the thread opens, and again every
-  // time a live message re-flags the mounted thread. Without this the rail
-  // badge is permanent — no code path clears a live member slot's unread
-  // until the slot itself is deleted.
+  // switchSlot, the only other markSlotRead caller). Two things follow:
+  //
+  // 1. The websocket unread-marker must learn about the open thread another
+  //    way, or it flags every message that lands in it. It reads
+  //    `viewedThread` beside `chat.activeSlot`; the visible-view effect below
+  //    registers the mounted thread there. Before this, each arrival was
+  //    flagged and drained a render later, and both writes relayed to the
+  //    parent dashboard's crew tab -- a badge that lit and vanished on every
+  //    message.
+  // 2. A flag that was set while the thread was NOT on screen (closed, or
+  //    this window hidden) still has to be drained when it opens or is
+  //    revealed. Without this the rail badge is permanent -- no code path
+  //    clears a live member slot's unread until the slot itself is deleted.
   const dispatch = useAppDispatch()
   const activeSlotUnread = useAppSelector(
     (s) => !!activeSlot && s.dashboard.unreadSlots.includes(activeSlot),
@@ -1057,6 +1065,21 @@ export default function MembersPage() {
       emitSlotRead(activeSlot, activeSlotLastTs)
     }
   }, [activeSlot, activeSlotUnread, pageVisible, activeSlotLastTs, dispatch])
+  // Tell the unread-marker which thread is on screen, for exactly as long as
+  // it is: registered while the thread is mounted AND this window is visible
+  // and focused, retired on switch, hide, blur and unmount. A hidden window's
+  // open thread therefore badges like any other slot, and the read effect
+  // above drains it on reveal -- same visibility bar for both directions.
+  useEffect(() => {
+    if (!activeSlot || !pageVisible) return
+    setViewedThreadSlot(activeSlot)
+    return () => {
+      // Like switchSlot, flush before retiring the view so its trailing read
+      // timer cannot outlive it and clear a later, unseen message's badge.
+      flushSlotRead(activeSlot)
+      clearViewedThreadSlot(activeSlot)
+    }
+  }, [activeSlot, pageVisible])
 
   // Per-row unread marker: the rail badge says "1", this says WHICH member.
   // Keyed the same way isRunning resolves a member's slot (thread-endpoint

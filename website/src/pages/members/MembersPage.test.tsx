@@ -4,6 +4,8 @@ import { Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { renderWithProviders } from '../../test/helpers'
 import { markSlotUnread, sseConnected, sseSlots } from '../../store/dashboardSlice'
 import { memberThreadQueryKey } from '../../api/membersQuery'
+import { getViewedThreadSlot, _resetViewedThreadForTests } from '../../lib/viewedThread'
+import { bindSlotReadSender, emitSlotRead, _resetSlotReadRelayForTest } from '../../lib/slotReadRelay'
 import {
   __resetErrorJournalForTests,
   __resetNavSeamForTests,
@@ -220,6 +222,9 @@ beforeEach(() => {
   // opened in one case would otherwise be on the strip in the next.
   __resetPanelTabs()
   setWindowWidth(WIDE_WINDOW)
+  // Module-level "thread on screen" registration; a case that unmounted
+  // mid-effect would otherwise leave its slot registered for the next one.
+  _resetViewedThreadForTests()
 })
 
 describe('MembersPage roster', () => {
@@ -1237,11 +1242,84 @@ describe('MembersPage side panel (Crew summary tab) and edit jump', () => {
   })
 })
 
+describe('MembersPage viewed-thread registration', () => {
+  // The websocket unread-marker gates on `chat.activeSlot` OR the slot
+  // registered in `viewedThread`; this page never moves `chat.activeSlot`, so
+  // the registration is what stops every message in the OPEN thread from
+  // being flagged (and drained a render later -- a badge that lit and
+  // vanished on the parent dashboard's crew tab for each message).
+
+  it('registers the mounted thread while the window is visible and focused', async () => {
+    await renderPage()
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+  })
+
+  it('re-registers on switch: the new thread replaces the old one', async () => {
+    await renderPage([row(), row({ name: 'scout', slug: 'scout' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    fireEvent.click(await rosterRow('scout'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-scout'))
+  })
+
+  it('retires the registration while the window is hidden, and restores it on reveal', async () => {
+    await renderPage()
+    fireEvent.click(await rosterRow('oncall'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    await waitFor(() => expect(getViewedThreadSlot()).toBeNull())
+    hidden.mockReturnValue(false)
+    act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    hidden.mockRestore()
+  })
+
+  it('flushes the pending trailing read synchronously when the registration retires', async () => {
+    const { unmount } = await renderPage()
+    fireEvent.click(await rosterRow('oncall'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    // Start after the opening read, with only this burst in the relay buffer.
+    _resetSlotReadRelayForTest()
+    vi.useFakeTimers()
+    const sent: [string, string | undefined][] = []
+    bindSlotReadSender((slot, ts) => sent.push([slot, ts]))
+    try {
+      emitSlotRead('member-oncall', '2026-09-10T00:00:01Z')
+      emitSlotRead('member-oncall', '2026-09-10T00:00:02Z')
+      expect(sent).toEqual([['member-oncall', '2026-09-10T00:00:01Z']])
+
+      unmount()
+
+      // No timer advancement: the component cleanup must send the trailing read.
+      expect(sent).toEqual([
+        ['member-oncall', '2026-09-10T00:00:01Z'],
+        ['member-oncall', '2026-09-10T00:00:02Z'],
+      ])
+      expect(getViewedThreadSlot()).toBeNull()
+    } finally {
+      unmount()
+      _resetSlotReadRelayForTest()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retires the registration on unmount', async () => {
+    const { unmount } = await renderPage()
+    fireEvent.click(await rosterRow('oncall'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    unmount()
+    expect(getViewedThreadSlot()).toBeNull()
+  })
+})
+
 describe('MembersPage unread drain', () => {
-  // The websocket unread-marker flags any slot that is not `chat.activeSlot`,
-  // and this page never moves `chat.activeSlot` — so the page itself must
-  // drain the mounted thread's unread flag, or the Crew Members rail badge is
-  // permanent (nothing else clears a live member slot's unread).
+  // A flag set while the thread was NOT on screen (closed, or this window
+  // hidden) is drained when it opens or is revealed -- the page itself must
+  // do it, or the Crew Members rail badge is permanent (nothing else clears
+  // a live member slot's unread).
 
   it('opening a flagged member thread drains its unread flag', async () => {
     const { store } = await renderPage()
@@ -1259,8 +1337,9 @@ describe('MembersPage unread drain', () => {
     const { store } = await renderPage()
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
-    // Simulate the websocket marker firing while the user is looking at the
-    // thread (its check is against chat.activeSlot, which this page never sets).
+    // A flag landing on the open thread from elsewhere (a manual mark-as-unread,
+    // a restored badge) is still drained -- the marker itself no longer flags
+    // the registered thread, so this is the belt behind that suspender.
     act(() => {
       store.dispatch(markSlotUnread('member-oncall'))
     })
