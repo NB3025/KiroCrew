@@ -3890,7 +3890,12 @@ async def _acquire_backend(
 
     was_spawned = False
     label = pool_key.human_readable()
-    charge_kind = "prewarm" if prewarm else ("exclusive" if exclusive_stub_uuid else "pooled")
+    if prewarm:
+        charge_kind = "prewarm"
+    elif exclusive_stub_uuid:
+        charge_kind = "exclusive"
+    else:
+        charge_kind = "pooled"
 
     async def _spawn() -> Backend:
         # Runs only when the pool creates a new backend (guarded by the
@@ -4826,11 +4831,13 @@ def _classify_rejection(exc: BaseException, *, exclusive: bool) -> Optional[_Rej
     if isinstance(exc, _TargetUnknown):
         return _Rejection(REJECT_CLASS_COMPAT, fallback=True)
     if isinstance(exc, _CAPACITY_FAILURES):
-        return _capacity_rejection(
-            5
-            if isinstance(exc, SpawnGateClosed)
-            else (60 if isinstance(exc, BackendUnavailable) else _CAPACITY_RETRY_AFTER_SECS)
-        )
+        if isinstance(exc, SpawnGateClosed):
+            retry_after_secs = 5
+        elif isinstance(exc, BackendUnavailable):
+            retry_after_secs = 60
+        else:
+            retry_after_secs = _CAPACITY_RETRY_AFTER_SECS
+        return _capacity_rejection(retry_after_secs)
     if isinstance(exc, OSError):
         # An errno in ``_PRESSURE_ERRNOS`` says the HOST is out of what an exec
         # would need too, so it is capacity; any other errno is this daemon's
