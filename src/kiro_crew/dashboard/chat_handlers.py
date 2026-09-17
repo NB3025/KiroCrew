@@ -6191,6 +6191,51 @@ def _slot_replaced_while_queued(
     return True
 
 
+def _switch_target_busy(
+    state: DashboardState, slot: _ChatSlot, session_key: str, provider: object
+) -> bool:
+    """Whether a turn is in flight on *session_key* -- the switch handlers' pre-commit refusal.
+
+    Every switch handler that resets the live session (agent, model, bulk
+    model, reasoning effort, workspace) refuses BEFORE it commits so nothing
+    needs rolling back. The refusal reads three signals, and each one sees a
+    window the others miss:
+
+    * ``slot.running`` -- set at dispatch, BEFORE the multi-second
+      ``provider.start()`` registers a session, so a cold-starting first
+      turn dispatched through THIS slot is visible here and nowhere else.
+    * ``provider.has_active_turn()`` -- the registered provider's own view,
+      which also sees a channel-linked turn that runs under the shared key
+      without ever setting this slot's ``task``. *provider* is whatever
+      ``state.sessions.get_provider(session_key)`` answered the caller just
+      before this call (the caller reads it once and may need it afterwards).
+      ``isinstance``, not a None check: the base class documents that
+      caller-side guards defend against test doubles that are not
+      ``LLMProvider`` instances, and the base default is False so no real
+      provider is missed.
+    * ``state.running_session_keys()`` -- the effective-session-key set of
+      every slot whose ``task`` is live. Two alias slots can drive ONE
+      session (a channel-linked slot and its dashboard twin), and a switch
+      issued through alias A while alias B is cold-starting sees neither of
+      the first two signals: A's ``running`` is False and B's provider is
+      not registered yet. Without this set the switch commits, resets
+      nothing, and reports success while the session comes up on B's
+      captured (old) bindings -- the header advertises one agent/model/
+      workspace and the live process runs another.
+
+    Call it INSIDE the switch locks, with the *session_key* resolved there
+    (the value the probe and the reset act on). Callers keep the atomic
+    ``skip_if_busy`` decline in ``SessionManager.reset`` as the backstop for
+    a turn that starts after this read: message dispatch takes none of the
+    switch locks, so this is a fast path, not the authority.
+    """
+    if slot.running:
+        return True
+    if isinstance(provider, LLMProvider) and provider.has_active_turn():
+        return True
+    return session_key in state.running_session_keys()
+
+
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/agent — set agent for a chat slot."""
     state: DashboardState = request.app["state"]
@@ -6300,16 +6345,12 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # and the _cancel_target subtlety): a RUNNING turn owns a captured
         # identity because ``linked_session_key`` is mutable, so the key
         # resolved above may not be the turn's — tearing it down would kill
-        # the wrong session (or the streaming turn itself). slot.running is
-        # checked first because it is set at dispatch, BEFORE provider.start()
-        # registers a session, so a cold-starting first turn is invisible to
-        # get_provider but not to slot.running. A 409 is retryable once the
-        # turn completes. Checked BEFORE the commit below, so nothing needs
-        # rolling back.
+        # the wrong session (or the streaming turn itself). The three signals
+        # and why each is needed live on _switch_target_busy. A 409 is
+        # retryable once the turn completes. Checked BEFORE the commit below,
+        # so nothing needs rolling back.
         busy_provider = state.sessions.get_provider(session_key)
-        if slot.running or (
-            isinstance(busy_provider, LLMProvider) and busy_provider.has_active_turn()
-        ):
+        if _switch_target_busy(state, slot, session_key, busy_provider):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -7187,25 +7228,20 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             slot._model_pick_gen += 1
             return web.json_response({"ok": True, "model": model_name})
         provider = state.sessions.get_provider(session_key)
-        if slot.running or (isinstance(provider, LLMProvider) and provider.has_active_turn()):
+        if _switch_target_busy(state, slot, session_key, provider):
             # Never tear down an in-flight turn: _try_live_model_switch
             # declines a mid-turn live switch, so falling through would take
             # the reset fallback and kill the streaming turn for any
             # programmatic caller (the UI disables the picker mid-turn, but
             # the API has no such guard). Answer busy instead — same policy
             # as the effort handler's defer-not-reset branch and the bulk
-            # handler's skip_running default. slot.running is checked FIRST
-            # because it is set at dispatch, BEFORE the multi-second
-            # provider.start() registers a session — a cold-starting first
-            # turn is invisible to get_provider but not to slot.running
-            # (api_chat's own busy gate uses the same signal). The refusal
-            # applies to EVERY provider class with an active turn, not only
-            # the ACP one that could have gone live: the reset fallback below
-            # tears down the in-flight turn regardless of provider type, and
-            # a 409 is retryable once the turn completes. isinstance, not a
-            # None check: the base class documents that caller-side guards
-            # defend against test doubles that are not LLMProvider instances,
-            # and the base default is False so no real provider is missed.
+            # handler's skip_running default. The refusal applies to EVERY
+            # provider class with an active turn, not only the ACP one that
+            # could have gone live: the reset fallback below tears down the
+            # in-flight turn regardless of provider type, and a 409 is
+            # retryable once the turn completes. The signals it reads, and
+            # the sibling-alias window only the third one covers, are on the
+            # helper.
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -7836,19 +7872,20 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             if slot.model == model_name:
                 unchanged.append(name)
                 continue
-            if skip_running and slot.running:
-                skipped_running.append(name)
-                continue
-            # Last-instant busy re-check on the EFFECTIVE session, same as the
-            # single-slot handler: slot.running only sees turns dispatched
-            # through this slot's task, and a channel-linked slot's turn runs
-            # under its linked key without setting it. _reset_slot_session
-            # clears pending waits BEFORE its atomic decline (its docstring's
-            # safety argument assumes a caller-side busy check microseconds
-            # old), so entering it against a live linked turn would reject
-            # that turn's cards even though the reset itself declines.
+            # Busy check on the EFFECTIVE session, same predicate as the
+            # single-slot handler (_switch_target_busy): slot.running only
+            # sees turns dispatched through this slot's task; a
+            # channel-linked slot's turn runs under its linked key without
+            # setting it, and a sibling alias cold-starting on the shared
+            # session has set neither. _reset_slot_session clears pending
+            # waits BEFORE its atomic decline (its docstring's safety
+            # argument assumes a caller-side busy check microseconds old), so
+            # entering it against a live linked turn would reject that turn's
+            # cards even though the reset itself declines. Gated on
+            # skip_running like the atomic decline below: a caller that asked
+            # to switch running slots gets the reset regardless.
             live_now = state.sessions.get_provider(session_key)
-            if skip_running and isinstance(live_now, LLMProvider) and live_now.has_active_turn():
+            if skip_running and _switch_target_busy(state, slot, session_key, live_now):
                 skipped_running.append(name)
                 continue
             # Children guard (api_chat_slot_reload's): the reset tears down the
@@ -8117,14 +8154,14 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # Never tear down an in-flight turn (the model handler's policy,
             # and the _cancel_target subtlety: a RUNNING turn owns a captured
             # identity, so the key resolved above may not be the turn's).
-            # Re-probed here because the change_effort awaits above yielded
-            # the event loop; slot.running is checked first because a
-            # cold-starting first turn is invisible to get_provider. The
-            # effort-capable live provider's active turn never reaches this —
-            # the defer branch above already returned for it. A 409 is
-            # retryable once the turn completes; nothing is committed yet.
+            # Probed here because the change_effort awaits above yielded the
+            # event loop; the signals and the sibling-alias window are on
+            # _switch_target_busy. The effort-capable live provider's active
+            # turn never reaches this — the defer branch above already
+            # returned for it. A 409 is retryable once the turn completes;
+            # nothing is committed yet.
             recheck = state.sessions.get_provider(session_key)
-            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+            if _switch_target_busy(state, slot, session_key, recheck):
                 return web.json_response(
                     {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
                 )
@@ -8543,22 +8580,17 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
         if children_409 is not None:
             return children_409
         # Never tear down an in-flight turn: the model handler's early
-        # refusal, copied here. The reset
+        # refusal, shared through _switch_target_busy. The reset
         # below calls _unblock_pending_waits BEFORE SessionManager.reset's
         # atomic busy decline, so without this check a turn parked on a
         # pending approval has that approval rejected and only then gets a
-        # 409 -- the turn is altered despite the refusal. slot.running is
-        # checked FIRST because it is set at dispatch, before the multi-second
-        # provider.start() registers a session: a cold-starting first turn is
-        # invisible to get_provider but not to slot.running, and without this
-        # the switch would report success while that turn runs on the old
-        # project. isinstance, not a None check, for the reason the model
-        # handler documents. The atomic skip_if_busy decline stays as the
-        # backstop for a turn that starts after this read.
+        # 409 -- the turn is altered despite the refusal; and without the
+        # helper's third signal a switch through this slot while a sibling
+        # alias cold-starts would report success while that turn runs on the
+        # old project. The atomic skip_if_busy decline stays as the backstop
+        # for a turn that starts after this read.
         pre_provider = state.sessions.get_provider(session_key)
-        if slot.running or (
-            isinstance(pre_provider, LLMProvider) and pre_provider.has_active_turn()
-        ):
+        if _switch_target_busy(state, slot, session_key, pre_provider):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
