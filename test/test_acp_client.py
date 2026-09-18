@@ -9432,6 +9432,19 @@ class TestIsTransientRawError:
             _raise_acp_error(mismatch)
         assert mismatch_error.value.transient is False
 
+        production_missing_predecessor = {
+            "code": -32603,
+            "message": "Prompt failed",
+            "data": (
+                "messages.3.content.0: Invalid `signature` in `thinking` block. "
+                "The block is bound to a different conversation. "
+                "The `thinking` block that preceded this one when it was created "
+                "is missing from this request."
+            ),
+        }
+        with pytest.raises(AcpConversationBindingMismatch):
+            _raise_acp_error(production_missing_predecessor)
+
         reverse_order = {
             "code": -32603,
             "message": "Prompt failed",

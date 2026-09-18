@@ -28,7 +28,7 @@ from dashboard_owner_helpers import as_owner
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO, TurnUsage
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config.loader import KiroCrewConfig, ResolvedBindings
-from kiro_crew.dashboard.chat_runner import _tool_call_ws_payload
+from kiro_crew.dashboard.chat_runner import _run_chat, _tool_call_ws_payload
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
     _MAX_SOURCE_LINKS_PER_SLOT,
@@ -39,6 +39,7 @@ from kiro_crew.history import ConversationLog
 from kiro_crew.providers.base import (
     EVENT_CLEAR_STATUS,
     EVENT_COMPLETE,
+    EVENT_TEXT_CHUNK,
     LLMEvent,
 )
 
@@ -9182,6 +9183,53 @@ class TestRuntimeWiring:
         assert len(agent_spawn_calls) == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("emit_terminal", "settles"),
+        [(True, True), (False, False)],
+        ids=["real-terminal", "stream-eof"],
+    )
+    async def test_visible_replay_without_stop_reason_requires_terminal_event(
+        self, tmp_path, monkeypatch, emit_terminal, settles
+    ):
+        """An absent optional stop reason lands only with a real completion."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+
+        state = _make_state(tmp_path)
+        state.context_builder = None
+        state.broadcast_ws = MagicMock()
+        state.push_slots_update = MagicMock()
+        state.sessions.record_failure = AsyncMock()
+        state.sessions.consume_replay_suppression = MagicMock(return_value=False)
+        state.sessions.provider_switch_replay_pending = MagicMock(return_value=True)
+        state.sessions.mark_provider_switch_replay = MagicMock(return_value=True)
+        state.sessions.commit_provider_switch_replay_sid = AsyncMock(return_value=True)
+
+        async def stream(_message):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="landed")
+            if emit_terminal:
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+        client = MagicMock()
+        client.stream = stream
+        client.stream_command = stream
+        client.context_usage_pct = MagicMock(return_value=10.0)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, False, False))
+        slot = state.get_or_create_slot("absent-stop-replay")
+
+        await _run_chat(state, slot, "replay this turn")
+
+        if settles:
+            state.sessions.commit_provider_switch_replay_sid.assert_awaited_once_with(
+                "dashboard:absent-stop-replay"
+            )
+            state.sessions.mark_provider_switch_replay.assert_not_called()
+        else:
+            state.sessions.commit_provider_switch_replay_sid.assert_not_awaited()
+            state.sessions.mark_provider_switch_replay.assert_called_once_with(
+                "dashboard:absent-stop-replay"
+            )
+
+    @pytest.mark.asyncio
     async def test_replay_settlement_cancellation_releases_turn_permit(self, tmp_path, monkeypatch):
         """Cancellation during the durable worker write cannot strand the turn."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -17926,12 +17974,13 @@ class TestStopReasonCancelled:
     async def test_landed_turn_does_not_restore_the_reinjection_flag(self, tmp_path, monkeypatch):
         """The complement: a turn that lands must leave the flag cleared,
         otherwise the index is re-paid on every subsequent turn."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
         events = [
             LLMEvent(kind=EVENT_TEXT_CHUNK, text="a real answer"),
-            LLMEvent(kind=EVENT_COMPLETE),
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
         ]
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
         self._wire_reinjection(state, tmp_path, monkeypatch)
@@ -20527,6 +20576,41 @@ class TestRunChatTransientRetry:
         assert slot._poisoned_reset_used is True
         assert any(text.startswith("❌") for text in self._err_texts(slot))
 
+    @pytest.mark.parametrize(
+        ("refused", "text"),
+        (
+            (True, "request declined"),
+            (False, ""),
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_thinking_binding_recovery_stays_spent_after_unlanded_terminal(
+        self, tmp_path, monkeypatch, refused, text
+    ):
+        from kiro_crew.acp.types import STOP_REASON_END_TURN, STOP_REASON_REFUSAL
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        stop_reason = STOP_REASON_REFUSAL if refused else STOP_REASON_END_TURN
+
+        async def _stream(msg):
+            if text:
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=text)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=stop_reason)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        client = self._client(_stream)
+        self._wire_sessions(state, client)
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+        slot._poisoned_reset_used = True
+
+        # Nested depth keeps an empty terminal on its immediate give-up rung;
+        # neither it nor a refusal is evidence that a normal turn landed.
+        await _run_chat(state, slot, "follow up", _prompt_depth=1)
+
+        assert slot._poisoned_reset_used is True
+
     @pytest.mark.asyncio
     async def test_thinking_binding_recovery_is_purged_when_stop_lands_during_discard(
         self, tmp_path, monkeypatch
@@ -21415,6 +21499,7 @@ class TestRunChatTransientRetry:
         slot self-heals instead of telling the user to 'retry in a moment'
         forever."""
         from kiro_crew.acp.client import AcpError
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.llm_helpers import TRANSIENT_RETRIES
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
@@ -21430,7 +21515,7 @@ class TestRunChatTransientRetry:
             if call_count <= _poisoned_calls:
                 raise AcpError(self._TRANSIENT)
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="recovered-after-discard")
-            yield LLMEvent(kind=EVENT_COMPLETE)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
 
         state = self._make_state(tmp_path, monkeypatch)
         # fallback_model="" (disabled): pins the PRE-FEATURE escalation ladder
@@ -21540,7 +21625,7 @@ class TestRunChatTransientRetry:
         streaming turn → exhaustion would discard a healthy conversation),
         while a cancelled turn with NO output proves nothing and preserves
         it. In both cases the spent one-shot stays consumed."""
-        from kiro_crew.acp.types import STOP_REASON_CANCELLED
+        from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
@@ -21581,7 +21666,7 @@ class TestRunChatTransientRetry:
         # ── A genuinely LANDED turn re-arms the one-shot too. ──
         async def _ok(msg):
             yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="landed")
-            yield LLMEvent(kind=EVENT_COMPLETE)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
 
         client.stream = _ok
         client.stream_command = _ok

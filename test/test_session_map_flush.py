@@ -515,9 +515,12 @@ class TestReplaySettlement:
         # rollback snapshot written after the cancelled worker drains.
         session_map.set("dashboard:concurrent", "sid-concurrent")
         task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
         await _settle(session_map)
 
         entry = session_map._data[key]
@@ -580,9 +583,12 @@ class TestReplaySettlement:
         await _await_event(entered, "the superseded settlement worker")
         session_map.clear_sid(key)
         task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
         await _settle(session_map)
 
         entry = session_map._data[key]
@@ -628,9 +634,12 @@ class TestReplaySettlement:
         )
         await _await_event(entered, "the settlement before compensation retry")
         task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
 
         assert compensation_attempts == 2
         assert session_map._data[key]["sid"] == "sid-prior"
@@ -669,9 +678,12 @@ class TestReplaySettlement:
         await _await_event(entered, "the identity-fenced settlement worker")
         current["value"] = False
         task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
 
         entry = session_map._data[key]
         assert entry["sid"] == "sid-fresh"
