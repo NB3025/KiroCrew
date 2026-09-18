@@ -46,6 +46,7 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
+    retained_outcome_blocks_rearm,
 )
 from kiro_crew.monitoring.registry import (
     publicly_armable_kinds,
@@ -1308,6 +1309,12 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # contract test asserts this dict by EXACT equality. The applier reads it
     # with ``.get``, so absent and empty mean the same thing there.
     banner = str(args.get("banner") or "").strip()
+    # Before the payload is built, so the emitted dict is byte-identical to what
+    # it was (its shape is asserted by exact equality in the contract test) and a
+    # certain refusal is reported instead of acknowledged.
+    blocked = _retained_stop_refusal("monitor_start", sk)
+    if blocked:
+        return blocked
     payload: dict[str, Any] = {
         "message": message,
         "idle_secs": interval_secs,
@@ -1376,6 +1383,54 @@ def _monitor_context_refusal(
     return f"Error: {message}"
 
 
+def _retained_stop_refusal(tool_name: str, session_key: str) -> str:
+    """Refuse IN BAND when a retained stop makes this call certain to be refused.
+
+    An arming tool answers the model over its own pipe DURING the turn, while
+    ``apply_session_directive`` runs after the turn's result is processed. A
+    refusal decided there cannot reach the model in the arming turn, so without a
+    preflight the model ends its turn holding a "requested" ack for a monitor that
+    does not exist. This is the only place that can say otherwise in time.
+
+    Reads the endpoint ``monitor_inspect`` already reads, so it grants no new
+    capability, and NEVER writes: clearing retained evidence stays owner-only.
+
+    Fails OPEN -- an unreadable gateway returns ``""`` and the caller emits as
+    before, because failing closed would let one bad read block all arming. The
+    turn boundary remains the enforcement point, so both TOCTOU directions are
+    benign: a record cleared just after the read costs one retryable refusal, and
+    one written just after it is still caught authoritatively.
+
+    Scope is the STRUCTURED record, the only one the endpoint reports an outcome
+    for. A paused legacy timer loop reads as ``autonudge_loop`` with no outcome
+    and is left to the existing create-only refusal.
+    """
+    try:
+        reading = mcp_core._get("/api/autonudge/session-monitor", session_key=session_key)
+    except Exception:
+        return ""
+    if not isinstance(reading, dict) or reading.get("error") or reading.get("active"):
+        return ""
+    monitor = reading.get("monitor")
+    if not isinstance(monitor, dict):
+        return ""
+    outcome = monitor.get("outcome")
+    if not retained_outcome_blocks_rearm(outcome, monitor.get("stopped_reason")):
+        return ""
+    target = str(monitor.get("target") or "").strip()
+    return (
+        f"{tool_name}: NOT applied — this session's automation binding still holds a "
+        f"STOPPED monitor"
+        + (f" on {target}" if target else "")
+        + f" whose outcome ({outcome}) is retained as evidence, so a re-arm here is "
+        "refused and nothing would be watched. The record is deliberately not "
+        "replaceable by an agent: only the session's owner can clear it, from the "
+        "dashboard's goal/automation popover (Clear), after which this call will "
+        "succeed. Tell the user that is the one step needed, and do NOT report "
+        "monitoring as started. Use monitor_inspect to read the retained record."
+    )
+
+
 def _parsed_pull_request_target(kind: Any, raw: Any) -> tuple[str, str]:
     """Return ``(url, "")`` for a valid PR target, or ``("", "Error: …")``.
 
@@ -1419,6 +1474,12 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
     target, target_error = _parsed_pull_request_target(args["kind"], args["target"])
     if target_error:
         return target_error
+    # AFTER target validation so a malformed target keeps its own specific error,
+    # and before the directive is emitted so the model is never handed a
+    # success-shaped ack for an arm a retained stop guarantees will be refused.
+    blocked = _retained_stop_refusal("monitor_watch", sk)
+    if blocked:
+        return blocked
     payload = {
         "kind": args["kind"],
         "target": target,
@@ -1435,10 +1496,19 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
     return _emit_directive(
         "monitor_watch",
         payload,
+        # Non-committal by construction: arming happens when this turn's result is
+        # processed, so no text produced here can confirm it. It must therefore name
+        # the NOT-armed notice, or a refused arm reads as monitoring started.
         "Structured monitor requested for this session; application is still pending. "
-        "End your turn so the owning session can apply it. The operator can confirm it in "
-        "the dashboard; the agent can call monitor_inspect only at the start of a later "
-        "turn or in response to a later wake.",
+        "End your turn now. Arming happens when this turn's result is processed, so "
+        "this ack cannot confirm it; the outcome is reported as a transcript notice "
+        'on this session — "Automation loop armed: …" or "Automation loop NOT armed: '
+        '<reason> [status N]". If the notice says NOT armed, read the reason before '
+        "trying again — a monitor the user stopped is retained as evidence and only "
+        "its owner can clear it. Do NOT report monitoring as started on the strength "
+        "of this ack; verify with monitor_inspect at the start of a later turn or in "
+        "response to a later wake, and treat active=true with a matching target as "
+        "the only confirmation.",
     )
 
 
@@ -1638,6 +1708,14 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
             "monitor_update: nothing to change — pass at least one of "
             "message, interval_secs, max_cycles, max_runtime_secs."
         )
+    # AFTER the empty-patch no-op so that more specific answer still wins. A
+    # retained stop cannot be updated either: ``update_monitor`` answers "not found
+    # or already terminal" at the turn boundary, and unlike the two arming
+    # directives a refused monitor_update gets no transcript notice at all — so
+    # without this the retarget failure is invisible to both the model and the user.
+    blocked = _retained_stop_refusal("monitor_update", sk)
+    if blocked:
+        return blocked
     return _emit_directive(
         "monitor_update",
         {"patch": patch},

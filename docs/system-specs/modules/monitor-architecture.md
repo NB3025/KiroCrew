@@ -581,6 +581,19 @@ enforced nowhere:
 - The stall streak is engine state, so a stuck watch stops itself. `MonitorState`
   carries `stall_digest`, `stall_streak` and `stall_started_at`; `decide_monitor`
   folds them and `monitor_stall_reason` names the stop `verdict_stall`.
+- A retained stop is evidence, and an arming tool must not acknowledge an arm it
+  cannot apply. Only a SYSTEM-imposed outcome is displaceable by a re-arm; a
+  consumer-recorded one (`USER_STOP`, `SESSION_CLOSE`, a quarantined record, an
+  outcome this version does not recognise) is preserved, and clearing it is an
+  owner-only dashboard action because it destroys audit evidence.
+  `monitoring.models.retained_outcome_blocks_rearm` is the one predicate that
+  answers this, consumed both by `autonudge._stopped_row_is_replaceable` at the
+  enforcement point and by the `mcp_tools.control` preflight that refuses in band
+  before the model ends its turn. What that shared predicate buys is that the
+  RULE cannot drift between the two sites; the preflight remains advisory, since
+  it fails open on an unreadable record and the turn boundary is what enforces.
+  Two copies of the rule is what lets the ack and the applier disagree on the
+  classification itself, which is the false-acknowledgement class of bug.
 
 ## Adding a new monitored kind
 

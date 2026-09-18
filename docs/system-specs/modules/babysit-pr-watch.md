@@ -75,6 +75,35 @@ existing record and its evidence. `monitor_update` is the only way to revise or
 re-arm the bound legacy loop. The binding-key and collision tests in
 `test_autonudge_stop_auth.py` pin that behavior.
 
+A retained stop is refused at the turn boundary, and the three tools say so
+before the turn ends **whenever the retained record is readable**.
+`mcp_tools.control._retained_stop_refusal` reads the same
+`/api/autonudge/session-monitor` endpoint `monitor_inspect` reads and, when the
+binding holds an inactive record whose outcome is retained evidence, returns a
+refusal naming the retained outcome, its target, and the owner-only clear —
+instead of an ack. This closes a false acknowledgement rather than adding a
+capability: the tool answers the model over its own pipe DURING the turn while
+`apply_session_directive` runs after the turn's result is processed, so the
+authorizer's refusal and the `ARM_REFUSAL_NOTICE_PREFIX` transcript notice both
+arrive after the model has ended its turn believing a monitor exists. The
+preflight is read-only and fails OPEN — an unreachable gateway arms as before,
+because a preflight that failed closed would let one bad read block all arming —
+and the turn-boundary refusal remains the enforcement point. So the preflight is
+an ADVISORY early answer, not a second gate: on an unreadable read, and in the
+TOCTOU window where the record changes after the read, the in-turn answer and the
+enforced outcome can still differ, and the turn boundary is what settles it. It
+never clears or overwrites a record: clearing retained evidence stays the
+owner-only dashboard action. `monitoring.models.retained_outcome_blocks_rearm` is
+the single predicate shared with `autonudge._stopped_row_is_replaceable`, so what
+cannot drift is the RULE itself — one outcome classification serves both sites,
+rather than two copies diverging. The replaceable/retained split is pinned as
+explicit data in `test_monitor_retained_stop_false_ack.py`, because a test that
+merely compares the two callers of one predicate is tautological. That file also
+covers all three tools, the fail-open paths, the system-imposed outcomes that
+must still arm, and the endpoint wire contract the refusal depends on — dropping
+`outcome` from `MONITOR_PUBLIC_FIELDS` would make the preflight fail open
+silently.
+
 `NudgeLoop.next_due_ts`, `notify_user_input`, and `notify_turn_complete` make
 dashboard-loop cadence deadline-preserving: user activity cancels a pending
 timer but does not move its deadline, and a delivered nudge begins its next

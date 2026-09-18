@@ -62,7 +62,6 @@ from kiro_crew.monitoring.models import (
     MONITOR_STATE_VERSION,
     MONITOR_STOP_APPROVAL_STALL,
     MONITOR_STOP_COMPLETION_UNAVAILABLE,
-    MONITOR_STOP_INVALID_RECORD,
     MONITOR_STOP_SESSION_CLOSE,
     MONITOR_STOP_SESSION_UNAVAILABLE,
     MONITOR_STOP_UNSUPPORTED_VERSION,
@@ -81,6 +80,7 @@ from kiro_crew.monitoring.models import (
     monitor_state_from_dict,
     monitor_state_to_dict,
     quarantine_monitor_state,
+    retained_outcome_blocks_rearm,
 )
 from kiro_crew.monitoring.registry import REVIEW_READY, kind_supports_objective
 from kiro_crew.probes import targets
@@ -230,22 +230,11 @@ def _stopped_row_is_replaceable(loop: "NudgeLoop") -> bool:
     """
     state = loop.monitor
     if state is not None and state.outcome is not None:
-        if str(state.stopped_reason or "") == MONITOR_STOP_INVALID_RECORD:
-            # A quarantined malformed record is an inspection artifact of a
-            # store defect, not a system-imposed stop: _load() synthesized its
-            # BLOCKED outcome precisely to retain the raw payload for a human.
-            # The ruling's fail-closed principle covers it — evidence, never
-            # replaceable.
-            return False
-        return state.outcome in (
-            MonitorOutcome.BUDGET,
-            MonitorOutcome.SUCCESS,
-            MonitorOutcome.BLOCKED,
-            # System-imposed too: a vanished or undeliverable subject
-            # (dispatch failure, shadow NOT_FOUND). No consumer authored it,
-            # so refusing re-creates the deadlock this predicate exists to end.
-            MonitorOutcome.TARGET_UNAVAILABLE,
-        )
+        # Delegated to the shared predicate in ``monitoring.models`` so the MCP
+        # preflight, which reads the same record over the session-monitor
+        # endpoint, cannot answer differently from this enforcement point. The
+        # quarantined-record and fail-closed rules live there.
+        return not retained_outcome_blocks_rearm(state.outcome, state.stopped_reason)
     return (loop.stopped_reason or "") in _REPLACEABLE_LOOP_STOP_REASONS
 
 
