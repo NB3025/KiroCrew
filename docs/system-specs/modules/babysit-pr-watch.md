@@ -93,7 +93,16 @@ an ADVISORY early answer, not a second gate: on an unreadable read, and in the
 TOCTOU window where the record changes after the read, the in-turn answer and the
 enforced outcome can still differ, and the turn boundary is what settles it. It
 never clears or overwrites a record: clearing retained evidence stays the
-owner-only dashboard action. `monitoring.models.retained_outcome_blocks_rearm` is
+owner-only dashboard action. It also runs **only in the MCP server**: a directive
+tool's handler is re-run a second time inside the GATEWAY by
+`mcp_core.derive_directive`, which discards the returned text, and that replay is
+called synchronously on the gateway's own event loop — so the preflight's
+blocking loopback read would ask the gateway for an answer only the loop already
+waiting on it could give, stalling every co-hosted session until the timeout.
+`mcp_core.directive_capture_active` is the seam the guard reads, and the skip
+costs nothing: the preflight exists to reach the MODEL in the arming turn, which
+only the MCP-side run can do.
+`monitoring.models.retained_outcome_blocks_rearm` is
 the single predicate shared with `autonudge._stopped_row_is_replaceable`, so what
 cannot drift is the RULE itself — one outcome classification serves both sites,
 rather than two copies diverging. The replaceable/retained split is pinned as

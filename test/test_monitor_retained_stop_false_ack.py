@@ -443,12 +443,10 @@ class TestTheWireContractTheRefusalDependsOn:
 class TestTheTwoSitesDoNotDrift:
     """The agent's answer and the applier's answer come from one predicate."""
 
-    # The truth table, written out as DATA rather than derived from the code under
-    # test. _stopped_row_is_replaceable now delegates to the predicate, so any
-    # test comparing the two is tautological -- it proves the delegation is wired
-    # and says nothing about whether the table is right. This is what actually
-    # pins the split, and it is the pre-refactor behaviour of
-    # _stopped_row_is_replaceable, transcribed.
+    # The truth table is DATA independent of the predicate under test. Because
+    # _stopped_row_is_replaceable delegates to that predicate, comparing only the
+    # two callers would be tautological: it proves the delegation is wired but not
+    # that the classification is right. This explicit table pins the contract.
     REPLACEABLE = {
         MonitorOutcome.SUCCESS,
         MonitorOutcome.BLOCKED,
@@ -492,3 +490,78 @@ class TestTheTwoSitesDoNotDrift:
     def test_no_recorded_outcome_blocks_nothing(self) -> None:
         assert retained_outcome_blocks_rearm(None) is False
         assert retained_outcome_blocks_rearm("") is False
+
+
+class TestThePreflightNeverBlocksTheGatewayEventLoop:
+    """The gateway replays an arming handler ON ITS OWN LOOP, synchronously.
+
+    ``derive_directive`` re-runs the handler inside the gateway process to
+    intercept the directive it publishes, called without an executor from the
+    aiohttp session-directive handler. A blocking loopback read issued from there
+    asks the gateway for an answer only the loop now waiting on it could produce,
+    so every co-hosted session stalls until the request times out.
+
+    The replay discards the handler's text, so the preflight has nothing to say
+    there and must not read at all. These tests pin the ABSENCE of that read --
+    the refusal itself is still delivered by the MCP-side run, and the turn
+    boundary still refuses the arm independently.
+    """
+
+    @pytest.mark.parametrize(
+        "tool,raw_args",
+        [
+            ("monitor_start", {"message": "keep checking"}),
+            (
+                "monitor_watch",
+                {
+                    "kind": "github_pull_request",
+                    "target": PR_B,
+                    "objective": "review_ready",
+                },
+            ),
+            ("monitor_update", {"max_cycles": 7}),
+        ],
+    )
+    def test_gateway_replay_derives_without_reading_its_own_endpoint(
+        self,
+        bound: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tool: str,
+        raw_args: dict[str, Any],
+    ) -> None:
+        """The actual replay seam must derive all three tools with zero reads."""
+        reads: list[str] = []
+
+        def _self_read(path: str, **_kwargs: Any) -> dict[str, Any]:
+            reads.append(path)
+            raise AssertionError("gateway replay must not make a blocking self-request")
+
+        monkeypatch.setattr(mcp_core, "_get", _self_read)
+
+        derived = mcp_core.derive_directive(tool, raw_args, bound)
+
+        assert derived is not None and derived[0] == tool
+        assert reads == []
+
+    def test_the_same_call_outside_capture_does_read_and_refuse(
+        self, bound: str, retained_user_stop: list[str]
+    ) -> None:
+        """The MCP-side run still performs the advisory in-turn preflight."""
+        refusal = control._retained_stop_refusal("monitor_watch", bound)
+
+        assert retained_user_stop == ["/api/autonudge/session-monitor"]
+        assert _names_the_blocker(refusal)
+
+    def test_the_predicate_tracks_the_capture_slot(self) -> None:
+        """``directive_capture_active`` is the seam the guard depends on."""
+        assert mcp_core.directive_capture_active() is False
+
+        sink: list[tuple[str, dict[str, Any]]] = []
+        previous = mcp_core._DIRECTIVE_CAPTURE.get()
+        mcp_core._DIRECTIVE_CAPTURE.set(sink)
+        try:
+            assert mcp_core.directive_capture_active() is True
+        finally:
+            mcp_core._DIRECTIVE_CAPTURE.set(previous)
+
+        assert mcp_core.directive_capture_active() is False

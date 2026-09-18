@@ -1312,9 +1312,9 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # Before the payload is built, so the emitted dict is byte-identical to what
     # it was (its shape is asserted by exact equality in the contract test) and a
     # certain refusal is reported instead of acknowledged.
-    blocked = _retained_stop_refusal("monitor_start", sk)
-    if blocked:
-        return blocked
+    retained_stop_refusal = _retained_stop_refusal("monitor_start", sk)
+    if retained_stop_refusal:
+        return retained_stop_refusal
     payload: dict[str, Any] = {
         "message": message,
         "idle_secs": interval_secs,
@@ -1395,6 +1395,14 @@ def _retained_stop_refusal(tool_name: str, session_key: str) -> str:
     Reads the endpoint ``monitor_inspect`` already reads, so it grants no new
     capability, and NEVER writes: clearing retained evidence stays owner-only.
 
+    SKIPPED ENTIRELY during gateway-side directive replay
+    (:func:`mcp_core.directive_capture_active`). That run discards this text, and
+    the read would be a blocking loopback request to the very gateway whose event
+    loop is synchronously waiting on this call -- it could not be answered, and
+    every co-hosted session would stall until the timeout. Nothing is lost: the
+    preflight exists to reach the MODEL in the arming turn, which only the MCP-side
+    run can do, and the turn boundary still refuses the arm on its own.
+
     Fails OPEN -- an unreadable gateway returns ``""`` and the caller emits as
     before, because failing closed would let one bad read block all arming. The
     turn boundary remains the enforcement point, so both TOCTOU directions are
@@ -1405,6 +1413,8 @@ def _retained_stop_refusal(tool_name: str, session_key: str) -> str:
     for. A paused legacy timer loop reads as ``autonudge_loop`` with no outcome
     and is left to the existing create-only refusal.
     """
+    if mcp_core.directive_capture_active():
+        return ""
     try:
         reading = mcp_core._get("/api/autonudge/session-monitor", session_key=session_key)
     except Exception:
@@ -1477,9 +1487,9 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
     # AFTER target validation so a malformed target keeps its own specific error,
     # and before the directive is emitted so the model is never handed a
     # success-shaped ack for an arm a retained stop guarantees will be refused.
-    blocked = _retained_stop_refusal("monitor_watch", sk)
-    if blocked:
-        return blocked
+    retained_stop_refusal = _retained_stop_refusal("monitor_watch", sk)
+    if retained_stop_refusal:
+        return retained_stop_refusal
     payload = {
         "kind": args["kind"],
         "target": target,
@@ -1713,9 +1723,9 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
     # or already terminal" at the turn boundary, and unlike the two arming
     # directives a refused monitor_update gets no transcript notice at all — so
     # without this the retarget failure is invisible to both the model and the user.
-    blocked = _retained_stop_refusal("monitor_update", sk)
-    if blocked:
-        return blocked
+    retained_stop_refusal = _retained_stop_refusal("monitor_update", sk)
+    if retained_stop_refusal:
+        return retained_stop_refusal
     return _emit_directive(
         "monitor_update",
         {"patch": patch},

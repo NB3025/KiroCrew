@@ -2050,6 +2050,26 @@ def capture_directive(kind: str, args: dict[str, Any]) -> bool:
     return True
 
 
+def directive_capture_active() -> bool:
+    """True while this call is a GATEWAY-SIDE replay under :func:`derive_directive`.
+
+    A directive tool's handler runs TWICE for one arming call: once in the MCP
+    server, where its return text answers the model, and once here, where
+    :func:`derive_directive` re-runs it only to intercept the directive it
+    publishes and DISCARDS the returned text (see :func:`_call_tool_body`).
+
+    The two runs differ in one way that matters for I/O: this one executes on the
+    gateway's OWN event loop, called synchronously from the aiohttp handler, so a
+    blocking loopback request back to this same gateway cannot be serviced while
+    it waits -- every session stalls until that request times out.
+
+    A handler that reads gateway state only to shape its REFUSAL TEXT must
+    therefore skip the read here: the text is discarded, and the turn boundary
+    re-decides authoritatively either way.
+    """
+    return _DIRECTIVE_CAPTURE.get() is not None
+
+
 def derive_directive(
     tool: str, raw_args: dict[str, Any], session_key: str
 ) -> tuple[str, dict[str, Any]] | None:
