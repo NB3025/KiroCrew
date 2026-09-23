@@ -52,7 +52,7 @@ on:
     # guard, and `requested` is deliberately absent.
     #
     # Why `requested` carries nothing: it fires when a run is CREATED, which on
-    # a head update happens for all 14 workflows above before any of them can
+    # a head update happens for all 19 workflows above before any of them can
     # have a verdict -- and readiness has already published `checking` for that
     # revision via the `pull_request_target: synchronize` path. Its only other
     # occasion is a brand-new run, whose eventual `completed` is the fire that
@@ -70,9 +70,9 @@ on:
     # trade a merge-safety guard for dispatch, which is the wrong direction.
     #
     # The dispatch problem this addresses: every type fires once per monitored
-    # workflow per revision, so all three dispatched up to 42 readiness runs per
+    # workflow per revision, so all three dispatched up to 57 readiness runs per
     # head update and made this workflow the majority of the repository's run
-    # creation. Two types put the ceiling at 28. The per-revision concurrency
+    # creation. Two types put the ceiling at 38. The per-revision concurrency
     # group below collapses the burst for EXECUTION, but a collapsed run has
     # already consumed its dispatch slot, so the group never bounded this cost.
     # Measurements and the queue-saturation mechanism: docs/ci/ci-and-reviews.md.
@@ -240,7 +240,8 @@ jobs:
             case "$job_start" in ''|*[!0-9]*) job_start="$(date +%s)" ;; esac
             job_deadline=$(( job_start + GH_RETRY_JOB_BUDGET_SECONDS ))
 
-            for attempt in 1 2 3; do
+            attempt=1
+            while [ "$attempt" -le "$GH_RETRY_ATTEMPTS" ]; do
               call="$(next_read_call)"
               # `bounded` caps a hanging attempt. Stdout remains buffered so a
               # failed paginated read cannot leak a partial JSON document.
@@ -294,6 +295,7 @@ jobs:
                 echo "pr-readiness: quota resource=core remaining=$remaining reset=$reset wait=$wait decision=wait-retry" >&2
                 rate_retry_used=true
                 sleep "$wait"
+                attempt=$(( attempt + 1 ))
                 continue
               fi
 
@@ -308,6 +310,7 @@ jobs:
               if [ "$attempt" -lt "$GH_RETRY_ATTEMPTS" ]; then
                 sleep $(( attempt * 2 ))
               fi
+              attempt=$(( attempt + 1 ))
             done
             return "$rc"
           }
@@ -817,6 +820,10 @@ jobs:
             # branch. Split on `|` alone so a label keeps its spaces.
             IFS='|' read -r file label extid trigfile <<<"$spec"
             if [[ "$file" == checkrun:* ]]; then
+              if [ -n "${trigfile:-}" ] && [ "$trigfile" != "fast-gate.yml" ]; then
+                echo "::error::check-run trigger must be fast-gate.yml before reusing the Fast Gate snapshot." >&2
+                exit 1
+              fi
               # Fork AI-review lane: the verdict lives in the head SHA's
               # check-runs, not a PR-bound workflow run (the fork reviewer runs
               # via workflow_run from the default branch, so its workflow-run
@@ -871,7 +878,7 @@ jobs:
               # head, so a stale clean verdict is not merely old, it can be WRONG.
               #
               # The fourth spec field names the workflow whose completion triggers
-              # the lane (Fast Gate, for all five). Its newest run for this head,
+              # the lane (Fast Gate, for all seven). Its newest run for this head,
               # plus that run's attempt, is what "the current attempt" means -- so
               # the expected id is <prefix><pr>-<run id>-<attempt> and nothing
               # else matches. When the expected row is not there yet, total=0 ->

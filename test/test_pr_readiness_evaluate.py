@@ -317,6 +317,7 @@ class Runner:
         rate_limit_remaining: str = "",
         rate_limit_reset_after: int | None = None,
         job_elapsed_seconds: int = 0,
+        script: str | None = None,
     ):
         env = dict(self.env)
         if disposition_ok:
@@ -347,7 +348,7 @@ class Runner:
             env["FLAKY_SUBSTR"] = flaky_substr
             env["FLAKY_FAILS"] = str(flaky_fails)
         proc = subprocess.run(
-            ["bash", "-c", _evaluate_script()],
+            ["bash", "-c", script if script is not None else _evaluate_script()],
             env=env,
             capture_output=True,
             text=True,
@@ -359,12 +360,21 @@ class Runner:
             outputs[key] = value
         return proc, outputs
 
+    def set_retry_attempts(self, attempts: int) -> None:
+        """Change the installed helper's declared retry bound for one test."""
+        helper = self.temp / "gh-retry.sh"
+        script = helper.read_text()
+        declaration = "GH_RETRY_ATTEMPTS=3"
+        assert script.count(declaration) == 1
+        helper.write_text(script.replace(declaration, f"GH_RETRY_ATTEMPTS={attempts}"))
+
     def backoff(self) -> list[int]:
         """Seconds the retry helper asked to sleep, in order."""
         log = self.fixtures / "sleeps"
         if not log.is_file():
             return []
         return [int(ln) for ln in log.read_text().split()]
+
     def gh_calls(self, needle: str) -> list[str]:
         """Recorded gh calls containing ``needle``."""
         log = self.fixtures / "gh_calls"
@@ -479,6 +489,25 @@ class TestForkFastGateSnapshot:
         assert 'if [ "$file" = "fast-gate.yml" ]; then' in script[loop:]
         assert 'run="$fast_gate_run"' in script[loop:]
 
+    def test_a_non_fast_gate_trigger_spec_fails_loudly(self, runner: Runner):
+        script = _evaluate_script()
+        fast_gate_spec = (
+            '"checkrun:Internal Content Scan|Internal Content Scan|'
+            'internal-content-scan-pr-|fast-gate.yml"'
+        )
+        drifted_spec = fast_gate_spec.replace("fast-gate.yml", "other-gate.yml")
+        assert script.count(fast_gate_spec) == 1
+
+        proc, outputs = runner.evaluate(
+            fork=True,
+            script=script.replace(fast_gate_spec, drifted_spec),
+        )
+
+        assert proc.returncode != 0
+        assert outputs.get("status_state") != "pending"
+        assert "check-run trigger must be fast-gate.yml" in proc.stderr
+        assert runner.gh_calls("actions/workflows/other-gate.yml/runs") == []
+
 
 class TestTransientFailureIsRetried:
     def test_one_flake_still_reaches_the_real_verdict(self, runner: Runner):
@@ -504,6 +533,24 @@ class TestTransientFailureIsRetried:
         )
         assert proc.returncode == 0, proc.stderr
         assert outputs["status_state"] == "success"
+
+    def test_attempt_bound_is_derived_from_gh_retry_attempts(self, runner: Runner):
+        runner.set_retry_attempts(2)
+
+        proc, outputs = runner.evaluate(
+            flaky_substr=RUNS_READ, flaky_fails=99
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        assert int((runner.fixtures / "flaky_count").read_text()) == 2
+        assert runner.backoff() == [2]
+
+    def test_retry_loop_has_no_second_literal_attempt_bound(self):
+        helper = _helper_script()
+
+        assert "for attempt in 1 2 3" not in helper
+        assert 'while [ "$attempt" -le "$GH_RETRY_ATTEMPTS" ]; do' in helper
 
 
 class TestPersistentTransportFailureIsNonTerminal:
