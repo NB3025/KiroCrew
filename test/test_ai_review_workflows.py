@@ -29,6 +29,7 @@ FORK_REVIEW_LANES = (
     "fork-first-principles-review.yml",
     "fork-security-scope-review.yml",
 )
+FORK_STAGE2_WORKFLOW_RUN_LANES = FORK_REVIEW_LANES + ("fork-internal-content-scan.yml",)
 EXACT_IDENTITY_REVIEW_LANES = (
     "fork-opus-review.yml",
     "fork-gpt-review.yml",
@@ -236,6 +237,125 @@ def _step(workflow_name: str, step_name: str) -> dict:
 
 def _step_env(workflow_name: str, step_name: str) -> dict[str, str]:
     return {k: str(v) for k, v in (_step(workflow_name, step_name).get("env") or {}).items()}
+
+
+def _concurrency_group(workflow_name: str) -> str:
+    workflow = yaml.safe_load((WORKFLOWS / workflow_name).read_text(encoding="utf-8"))
+    return " ".join(str(workflow["concurrency"]["group"]).split())
+
+
+def _render_trusted_event_group(template: str, event: dict) -> str:
+    """Render the deliberately tiny trusted-event expression used by fork lanes."""
+    workflow_run = event.get("workflow_run") or {}
+    pull_request = event.get("pull_request") or {}
+    if "||" in template:
+        identity = workflow_run.get("id") or pull_request.get("id")
+        event_name = str(event.get("event_name") or "")
+        expression = "${{ github.event.workflow_run.id || github.event.pull_request.id }}"
+        assert event_name
+        assert template.count("${{") == 2
+        assert "${{ github.event_name }}" in template
+        template = template.replace("${{ github.event_name }}", event_name)
+    else:
+        identity = workflow_run.get("id")
+        expression = "${{ github.event.workflow_run.id }}"
+        assert template.count("${{") == 1
+    assert identity is not None
+    assert expression in template
+    return template.replace(expression, str(identity))
+
+
+class TestForkStage2ConcurrencyIdentity:
+    @pytest.mark.parametrize("lane", FORK_STAGE2_WORKFLOW_RUN_LANES)
+    def test_case_only_and_long_refs_cannot_collide_or_expand_review_groups(
+        self, lane: str
+    ) -> None:
+        template = _concurrency_group(lane)
+        prefix = f"{lane.removesuffix('.yml')}-"
+        sha = "a" * 40
+        case_upper = {
+            "workflow_run": {
+                "id": 101,
+                "run_attempt": 1,
+                "head_repository": {"full_name": "outside/example"},
+                "head_branch": "Feature/Case",
+                "head_sha": sha,
+            }
+        }
+        case_lower = {
+            "workflow_run": {
+                "id": 202,
+                "run_attempt": 1,
+                "head_repository": {"full_name": "outside/example"},
+                "head_branch": "feature/case",
+                "head_sha": sha,
+            }
+        }
+        long_ref = {
+            "workflow_run": {
+                "id": 303,
+                "run_attempt": 1,
+                "head_repository": {"full_name": "outside/example"},
+                "head_branch": "feature/" + "x" * 4096,
+                "head_sha": sha,
+            }
+        }
+
+        assert _render_trusted_event_group(template, case_upper) == f"{prefix}101"
+        assert _render_trusted_event_group(template, case_lower) == f"{prefix}202"
+        assert _render_trusted_event_group(template, long_ref) == f"{prefix}303"
+        assert len(f"{prefix}303") < 64
+        assert "head_branch" not in template
+        assert "head_repository" not in template
+        assert "head_sha" not in template
+
+    @pytest.mark.parametrize("lane", FORK_STAGE2_WORKFLOW_RUN_LANES)
+    def test_same_trigger_rerun_collapses_to_the_same_review_group(self, lane: str) -> None:
+        template = _concurrency_group(lane)
+        first = {"workflow_run": {"id": 987654321, "run_attempt": 1}}
+        rerun = {"workflow_run": {"id": 987654321, "run_attempt": 2}}
+
+        assert _render_trusted_event_group(template, first) == _render_trusted_event_group(
+            template, rerun
+        )
+
+    def test_workflow_guard_uses_bounded_identity_for_both_event_shapes(self) -> None:
+        template = _concurrency_group("fork-workflow-guard.yml")
+        sha = "a" * 40
+        workflow_run = {
+            "event_name": "workflow_run",
+            "workflow_run": {
+                "id": 404,
+                "run_attempt": 1,
+                "head_repository": {"full_name": "outside/example"},
+                "head_branch": "Feature/Case",
+                "head_sha": sha,
+            },
+        }
+        pull_request_target = {
+            "event_name": "pull_request_target",
+            "pull_request": {
+                "id": 404,
+                "head": {
+                    "repo": {"full_name": "outside/example"},
+                    "ref": "feature/" + "x" * 4096,
+                    "sha": sha,
+                },
+            },
+        }
+
+        assert (
+            _render_trusted_event_group(template, workflow_run)
+            == "fork-workflow-guard-workflow_run-404"
+        )
+        assert (
+            _render_trusted_event_group(template, pull_request_target)
+            == "fork-workflow-guard-pull_request_target-404"
+        )
+        assert len(_render_trusted_event_group(template, pull_request_target)) < 64
+        assert "head_branch" not in template
+        assert "head.ref" not in template
+        assert "head_sha" not in template
 
 
 class TestForkStage2ExactHeadIdentity:
@@ -1737,8 +1857,13 @@ class TestFirstPrinciplesReview:
             "WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}" in workflow
         )
         assert "WR_HEAD_REF: ${{ github.event.workflow_run.head_branch }}" in workflow
-        # The concurrency group must not collapse two PRs that share a commit.
-        assert "github.event.workflow_run.head_repository.full_name\n    }}-${{" in workflow
+        # The upstream run id is unique for sibling PR triggers and stable across
+        # attempts, so case-only refs cannot collide in GitHub's case-insensitive
+        # concurrency namespace while a rerun still replaces its earlier attempt.
+        assert (
+            _concurrency_group("fork-first-principles-review.yml")
+            == "fork-first-principles-review-${{ github.event.workflow_run.id }}"
+        )
 
     def test_aborted_review_is_not_reported_as_a_skip(self) -> None:
         # The diff fetch fails CLOSED on an oversized/empty diff or a rewritten
