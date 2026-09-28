@@ -14645,68 +14645,65 @@ async def _run_chat(
                 # A confirmed native clear is the one destructive slash command:
                 # replaying the persisted Kiro Crew history afterwards would undo
                 # the user's clear. The provider has ALREADY deleted history before
-                # this event arrives, so deletion wins even when durable settlement
-                # fails or is cancelled. The nested finally retires the in-memory
-                # lease and clears the visible window on every exit path.
+                # this event arrives, so deletion wins even when durable retirement
+                # fails transiently or is cancelled. The finally clears the visible
+                # window after the durable retirement has either committed or held
+                # cancellation until it did.
                 _clear_owes_replay_retirement = _replay_pending or _replay_accepted_this_turn
                 try:
                     if _clear_owes_replay_retirement:
-                        await state.sessions.acommit_provider_switch_replay_sid(session_key)
+                        await state.sessions.aretire_provider_switch_replay(session_key)
                 finally:
-                    try:
-                        if _clear_owes_replay_retirement:
-                            state.sessions.consume_provider_switch_replay(session_key)
-                    finally:
-                        _replay_pending = False
-                        _replay_accepted_this_turn = False
-                        # Advance the durable POSITION base by the rows this clear
-                        # evicts, exactly as the trim path does (`_ChatSlot.append`)
-                        # and as every restore path recomputes it. The base plus the
-                        # window's durable rows is the crew log turn ordinal and the
-                        # session_control `since` cursor space; emptying the window
-                        # without crediting the base made the next turn draw an
-                        # ordinal an earlier turn already wrote (two unrelated turns
-                        # then read as one turn with contradictory entries) and shifted
-                        # every cursor down. `durable_row_count` is the ONE shared
-                        # counting rule, so the base cannot disagree with the ordinal
-                        # about which rows are durable. Counted BEFORE the clear --
-                        # afterwards the rows are gone.
-                        slot._disk_older_durable_count += durable_row_count(slot.messages)
-                        slot.messages.clear()
-                        # The boundary was captured against the pre-clear message
-                        # count; the list is now empty, so reset it to 0 or the
-                        # clear-confirmation appended below would fall outside the
-                        # turn-stats scan slice and the completed turn would drop its
-                        # elapsed/credits stats.
-                        _turn_msg_boundary = 0
-                        _turn_start_mid = ""
-                        assistant_text = ""
-                        _wsred.reset()
-                        _produced_visible_output = True
-                        # slot_clear FIRST: it wipes the client's message list, so the
-                        # confirmation row must be delivered after it on every path
-                        # (append's own broadcast and the reader-suppressed frame alike)
-                        # or the wipe erases the confirmation it announces.
-                        state.broadcast_ws("slot_clear", {"slot": slot.key})
-                        # /clear abandons the plan too. Keeping the pill would make the
-                        # next cold start rebuild the cleared checklist into the fresh
-                        # conversation (todo_recovery_prompt), so the person could never
-                        # shed it.
-                        # Not on an ownerless frame: a shared runtime fans those out to
-                        # every peer runner, and a peer's checklist is not what this
-                        # session's /clear cleared.
-                        # Gated on THIS turn being the /clear, not on frame ownership: a
-                        # shared runtime marks the frame ownerless whenever a subagent is
-                        # registered, which is also true for the session that typed it.
-                        if _this_turn_is_clear and slot.set_todo(None):
-                            state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
-                        append_and_surface(
-                            state,
-                            slot,
-                            "assistant",
-                            "🗑️ Conversation cleared.",
-                            "msg msg-a",
-                        )
+                    _replay_pending = False
+                    _replay_accepted_this_turn = False
+                    # Advance the durable POSITION base by the rows this clear
+                    # evicts, exactly as the trim path does (`_ChatSlot.append`)
+                    # and as every restore path recomputes it. The base plus the
+                    # window's durable rows is the crew log turn ordinal and the
+                    # session_control `since` cursor space; emptying the window
+                    # without crediting the base made the next turn draw an
+                    # ordinal an earlier turn already wrote (two unrelated turns
+                    # then read as one turn with contradictory entries) and shifted
+                    # every cursor down. `durable_row_count` is the ONE shared
+                    # counting rule, so the base cannot disagree with the ordinal
+                    # about which rows are durable. Counted BEFORE the clear --
+                    # afterwards the rows are gone.
+                    slot._disk_older_durable_count += durable_row_count(slot.messages)
+                    slot.messages.clear()
+                    # The boundary was captured against the pre-clear message
+                    # count; the list is now empty, so reset it to 0 or the
+                    # clear-confirmation appended below would fall outside the
+                    # turn-stats scan slice and the completed turn would drop its
+                    # elapsed/credits stats.
+                    _turn_msg_boundary = 0
+                    _turn_start_mid = ""
+                    assistant_text = ""
+                    _wsred.reset()
+                    _produced_visible_output = True
+                    # slot_clear FIRST: it wipes the client's message list, so the
+                    # confirmation row must be delivered after it on every path
+                    # (append's own broadcast and the reader-suppressed frame alike)
+                    # or the wipe erases the confirmation it announces.
+                    state.broadcast_ws("slot_clear", {"slot": slot.key})
+                    # /clear abandons the plan too. Keeping the pill would make the
+                    # next cold start rebuild the cleared checklist into the fresh
+                    # conversation (todo_recovery_prompt), so the person could never
+                    # shed it.
+                    # Not on an ownerless frame: a shared runtime fans those out to
+                    # every peer runner, and a peer's checklist is not what this
+                    # session's /clear cleared.
+                    # Gated on THIS turn being the /clear, not on frame ownership: a
+                    # shared runtime marks the frame ownerless whenever a subagent is
+                    # registered, which is also true for the session that typed it.
+                    if _this_turn_is_clear and slot.set_todo(None):
+                        state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
+                    append_and_surface(
+                        state,
+                        slot,
+                        "assistant",
+                        "🗑️ Conversation cleared.",
+                        "msg msg-a",
+                    )
             elif event.kind == EVENT_AGENT_SWITCHED:
                 new_agent, _ = redact_credentials(event.text)
                 new_agent, _ = redact_exfiltration_urls(new_agent)
@@ -16876,19 +16873,25 @@ async def _run_chat(
             # succeeded. The promise-only continuation gets its own turn; if THAT
             # lands, it records success normally.
             state.sessions.record_success(session_key)
-            # A LANDED turn breaks the pre-stream-exhaustion streak and
-            # re-arms the poisoned-conversation one-shot: only a prompt that
-            # actually reached the model and completed proves the (possibly
-            # fresh) conversation works. Deliberately NOT in the cancel-
-            # inclusive budget block above — a Stop press during the recovery
-            # turn must not re-arm a second discard without that evidence.
-            slot._prestream_exhausted_cycles = 0
-            slot._poisoned_reset_used = False
+            # A landed turn re-arms the session-not-found one-shot (any landed
+            # turn proves the session exists; no conversation-shape evidence is
+            # needed, unlike the binding-recovery one-shot below).
             slot._session_not_found_retry_used = False
-            # This turn landed: the prompt (including any re-injected skills
-            # index) reached the model, so the `finally` must NOT restore the
-            # one-shot flag.
             _turn_landed = True
+            slot._prestream_exhausted_cycles = 0
+            # A refusal, synthetic terminal, or empty-response verdict did not
+            # prove that the rebuilt conversation accepted a normal turn. Keep
+            # only the binding-recovery one-shot spent until a real terminal
+            # lands; `_turn_landed` retains its broader shared contract for
+            # reinjection, nudge accounting, and interrupted-turn markers.
+            _strict_turn_landed = (
+                _saw_terminal_event
+                and _stop_reason in (None, "", STOP_REASON_END_TURN)
+                and not _terminal_synthetic
+                and not _had_empty_response_verdict
+            )
+            if _strict_turn_landed:
+                slot._poisoned_reset_used = False
             # Per-interaction telemetry (PlatformContext seam) — shared helper so
             # the payload shape and model reflection cannot drift across surfaces.
             record_interaction_event(client, session_key, "dashboard")

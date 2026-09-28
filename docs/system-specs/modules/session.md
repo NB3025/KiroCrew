@@ -55,16 +55,22 @@ Replay suppression is stronger than recovery. A binding discard neither clears
 an existing suppression nor creates debt for an absent session; consuming
 suppression clears `replay_pending`, retires the fallback SID, and disarms the
 live replay lease so removed history cannot return after a restart. A provider-
-confirmed `/clear` likewise wins after native history deletion: cancellation or
-failure of the awaited SID settlement cannot prevent the visible clear or leave
-the live replay lease armed.
+confirmed `/clear` likewise wins after native history deletion. It uses a
+separate durable retirement transaction that clears the prior SID and
+`replay_pending` in one payload, never restores their before-image, holds
+cancellation until the write finishes, and retries transient write failures
+fail-closed. The visible clear runs in `finally`, after retirement commits or
+cancellation has been delayed to that boundary.
 
 The queued binding retry carries its original session key plus slot- and session-
 scoped Stop generations. The queue drain validates those values before dequeue,
 and the runner validates them again at coroutine consumption and after awaited
 provider/context preparation. Stop, a newer message, a pending steer, or a rebind
 therefore cancels stale replay before it can open a provider turn; user successors
-continue, while an aborted replay cannot trigger automatic synthesis.
+continue through the shared pre-dispatch-abort drain, while an aborted replay
+cannot trigger automatic synthesis. The poisoned-conversation one-shot re-arms
+only after a real, non-synthetic terminal with no refusal or empty-response
+verdict; refusal, synthetic completion, and plain EOF leave it spent.
 
 ## Dashboard app launch intents
 

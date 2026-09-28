@@ -539,6 +539,117 @@ class TestReplaySettlement:
         assert session_map._written_seq > settlement_seq[0]
 
     @pytest.mark.asyncio
+    async def test_confirmed_clear_retirement_survives_cancellation(
+        self, session_map, tmp_path, monkeypatch
+    ):
+        key = "dashboard:replay-clear"
+        await self._seed(session_map, key)
+        entered = threading.Event()
+        release = threading.Event()
+        real_write = session_map._write_payload
+
+        def gated_retirement(payload, seq):
+            data = json.loads(payload)
+            entry = data[key]
+            if entry["sid"] == "" and not entry.get("flags", {}).get(REPLAY_PENDING_FLAG):
+                entered.set()
+                assert release.wait(timeout=10)
+            return real_write(payload, seq)
+
+        monkeypatch.setattr(session_map, "_write_payload", gated_retirement)
+        task = asyncio.create_task(session_map.retire_replay(key, replay_flag=REPLAY_PENDING_FLAG))
+        await _await_event(entered, "the confirmed-clear retirement worker")
+        task.cancel()
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=10)
+        finally:
+            release.set()
+        await _settle(session_map)
+
+        entry = session_map._data[key]
+        assert entry["sid"] == ""
+        assert entry["discarded_sid"] == "sid-prior"
+        assert session_map.get_flag(key, REPLAY_PENDING_FLAG) is False
+        persisted = _map_file(tmp_path)[key]
+        assert persisted["sid"] == ""
+        assert persisted["discarded_sid"] == "sid-prior"
+        assert persisted.get("flags", {}).get(REPLAY_PENDING_FLAG) is not True
+
+    @pytest.mark.asyncio
+    async def test_confirmed_clear_retirement_retries_write_failure(
+        self, session_map, tmp_path, monkeypatch
+    ):
+        key = "dashboard:replay-clear-retry"
+        await self._seed(session_map, key)
+        real_write = session_map._write_payload
+        calls = 0
+
+        def fail_once(payload, seq):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("retirement write failed")
+            return real_write(payload, seq)
+
+        monkeypatch.setattr(session_map, "_write_payload", fail_once)
+
+        await asyncio.wait_for(
+            session_map.retire_replay(key, replay_flag=REPLAY_PENDING_FLAG),
+            timeout=10,
+        )
+
+        assert calls == 2
+        entry = session_map._data[key]
+        assert entry["sid"] == ""
+        assert entry["discarded_sid"] == "sid-prior"
+        assert session_map.get_flag(key, REPLAY_PENDING_FLAG) is False
+        persisted = _map_file(tmp_path)[key]
+        assert persisted["sid"] == ""
+        assert persisted.get("flags", {}).get(REPLAY_PENDING_FLAG) is not True
+
+    @pytest.mark.asyncio
+    async def test_confirmed_clear_retirement_keeps_cancellation_across_retry(
+        self, session_map, tmp_path, monkeypatch
+    ):
+        key = "dashboard:replay-clear-cancel-retry"
+        await self._seed(session_map, key)
+        entered = threading.Event()
+        release = threading.Event()
+        real_write = session_map._write_payload
+        calls = 0
+
+        def fail_blocked_first_write(payload, seq):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                assert release.wait(timeout=10)
+                raise OSError("first retirement write failed")
+            return real_write(payload, seq)
+
+        monkeypatch.setattr(session_map, "_write_payload", fail_blocked_first_write)
+        task = asyncio.create_task(session_map.retire_replay(key, replay_flag=REPLAY_PENDING_FLAG))
+        await _await_event(entered, "the first retirement write")
+        task.cancel()
+        try:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=10)
+        finally:
+            release.set()
+        await _settle(session_map)
+
+        assert calls == 2
+        entry = session_map._data[key]
+        assert entry["sid"] == ""
+        assert session_map.get_flag(key, REPLAY_PENDING_FLAG) is False
+        persisted = _map_file(tmp_path)[key]
+        assert persisted["sid"] == ""
+        assert persisted.get("flags", {}).get(REPLAY_PENDING_FLAG) is not True
+
+    @pytest.mark.asyncio
     async def test_same_key_clear_supersedes_cancelled_settlement(
         self, session_map, tmp_path, monkeypatch
     ):
