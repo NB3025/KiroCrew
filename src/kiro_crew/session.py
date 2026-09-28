@@ -2723,6 +2723,24 @@ class SessionManager:
         session.provider_switch_replay = False
         return True
 
+    async def aretire_provider_switch_replay(self, key: str) -> bool:
+        """Retire replay debt and its fallback after native history deletion."""
+        folded = self._fold_key(key)
+        session = self._sessions.get(folded)
+        in_memory = bool(session is not None and session.provider_switch_replay)
+        durable = self._session_map.get_flag(folded, REPLAY_PENDING_FLAG)
+        if not (in_memory or durable):
+            return False
+        try:
+            await self._session_map.retire_replay(
+                folded,
+                replay_flag=REPLAY_PENDING_FLAG,
+            )
+        finally:
+            if session is not None:
+                session.provider_switch_replay = False
+        return True
+
     def consume_provider_switch_replay(self, key: str) -> bool:
         """Explicitly retire replay after confirmed native history deletion."""
         session = self._sessions.get(self._fold_key(key))

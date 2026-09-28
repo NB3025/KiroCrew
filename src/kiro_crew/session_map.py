@@ -2563,27 +2563,32 @@ class SessionMap:
         return self._serialize()
 
     @staticmethod
-    async def _sleep_despite_cancellation(delay: float) -> None:
-        sleeper = asyncio.create_task(asyncio.sleep(delay))
+    async def _await_task_despite_cancellation(
+        task: "asyncio.Task[object]",
+        cancelled: "list[asyncio.CancelledError]",
+    ) -> None:
+        """Finish *task* while retaining the first cancellation for its caller."""
         while True:
             try:
-                await asyncio.shield(sleeper)
+                await asyncio.shield(task)
                 return
-            except asyncio.CancelledError:
-                if sleeper.done():
-                    sleeper.result()
+            except asyncio.CancelledError as exc:
+                if not cancelled:
+                    cancelled.append(exc)
+                if task.done():
+                    task.result()
                     return
 
+    @staticmethod
+    async def _sleep_despite_cancellation(delay: float) -> None:
+        cancelled: list[asyncio.CancelledError] = []
+        sleeper = asyncio.create_task(asyncio.sleep(delay))
+        await SessionMap._await_task_despite_cancellation(sleeper, cancelled)
+
     async def _write_payload_despite_cancellation(self, payload: str, seq: int) -> None:
+        cancelled: list[asyncio.CancelledError] = []
         writer = asyncio.create_task(asyncio.to_thread(self._write_payload, payload, seq))
-        while True:
-            try:
-                await asyncio.shield(writer)
-                return
-            except asyncio.CancelledError:
-                if writer.done():
-                    writer.result()
-                    return
+        await self._await_task_despite_cancellation(writer, cancelled)
 
     async def _compensate_replay_settlement(self, settlement: _ReplaySettlement) -> None:
         delay = _REPLAY_COMPENSATION_INITIAL_DELAY_SECS
@@ -2664,6 +2669,47 @@ class SessionMap:
             replay_flag=replay_flag,
             still_current=still_current,
         )
+
+    @_guarded
+    def _prepare_replay_retirement(self, key: str, replay_flag: str) -> tuple[str, int]:
+        """Retire a confirmed-clear fallback and debt in one payload."""
+        key = canonical_key(key)
+        entry = self._ensure_entry(key)
+        _stash_and_clear_sid(entry)
+        flags = entry.get("flags")
+        if isinstance(flags, dict):
+            flags.pop(replay_flag, None)
+            if not flags:
+                entry.pop("flags", None)
+        self._dirty = False
+        return self._serialize()
+
+    async def retire_replay(self, key: str, *, replay_flag: str) -> None:
+        """Durably retire history after the provider confirmed deletion.
+
+        Unlike an ordinary replay settlement, this operation never restores its
+        before-image: the native history is already gone. Cancellation is held
+        until the retirement reaches disk, and transient write failures retry
+        fail-closed so a restart cannot revive the old fallback.
+        """
+        payload, seq = self._prepare_replay_retirement(key, replay_flag)
+        cancelled: list[asyncio.CancelledError] = []
+        delay = _REPLAY_COMPENSATION_INITIAL_DELAY_SECS
+        while True:
+            writer = asyncio.create_task(asyncio.to_thread(self._write_payload, payload, seq))
+            try:
+                await self._await_task_despite_cancellation(writer, cancelled)
+                break
+            except Exception:
+                self._restore_dirty()
+                logger.exception(
+                    "Confirmed-clear replay retirement failed; retrying before turn exit"
+                )
+                sleeper = asyncio.create_task(asyncio.sleep(delay))
+                await self._await_task_despite_cancellation(sleeper, cancelled)
+                delay = min(delay * 2, _REPLAY_COMPENSATION_MAX_DELAY_SECS)
+        if cancelled:
+            raise cancelled[0]
 
     def get_flag(self, key: str, flag: str) -> bool:
         """Return the value of a per-conversation boolean *flag* (default False)."""
