@@ -123,6 +123,7 @@ from kiro_crew.acp.runtime_process_tree import ChildRecord
 from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_deny_rules
 from kiro_crew.acp.transport_errors import (
     AcpAuthRequired,
+    AcpConversationBindingMismatch,
     AcpError,
     AcpModelUnavailable,
     AcpProcessDied,

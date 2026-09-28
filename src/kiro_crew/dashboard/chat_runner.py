@@ -37,6 +37,7 @@ from kiro_crew import (  # noqa: F401
 )
 from kiro_crew.acp.client import (
     AcpAuthRequired,
+    AcpConversationBindingMismatch,
     AcpError,
     AcpProcessDied,
     AcpPromptBusy,
@@ -362,6 +363,7 @@ from kiro_crew.dashboard.recovery_replays import (
     ReplayFamily,
     ReplayRevocation,
     cancel_notice,
+    cancel_reason,
     replays_of,
 )
 from kiro_crew.dashboard.session_directive_apply import (
@@ -6739,6 +6741,58 @@ async def _start_next_queued_turn(
     if await _drop_revoked_replays(state, slot):
         return False
 
+    # A preserved-thinking retry is destructive: it replaced the native
+    # conversation. Revalidate the intent at the final queue boundary so a Stop,
+    # correction, steer, or rebind that landed during discard wins instead.
+    _binding_entries = [
+        q
+        for q in slot._queue
+        if isinstance(q.get("meta"), dict) and q["meta"].get("binding_recovery") is True
+    ]
+    for _binding_entry in _binding_entries:
+        _meta = _binding_entry["meta"]
+        _binding_key = _meta.get("binding_session_key", "")
+        _binding_rebound = bool(_binding_key) and effective_session_key(slot) != _binding_key
+        _binding_stopped = getattr(slot, "_stop_generation", 0) != _meta.get(
+            "binding_stop_generation", getattr(slot, "_stop_generation", 0)
+        ) or _session_stop_generation_for(
+            getattr(state, "sessions", None), _binding_key or effective_session_key(slot)
+        ) != _meta.get(
+            "binding_session_stop_generation", 0
+        )
+        _binding_superseded = bool(getattr(slot, "_pending_steers", None)) or any(
+            q is not _binding_entry and not _queue_entry_is_orchestration(q) for q in slot._queue
+        )
+        if (
+            _binding_rebound
+            or _binding_stopped
+            or _binding_superseded
+            or slot._stopping
+            or _should_suppress_requeue(slot)
+        ):
+            slot.queue_remove_by_id(_binding_entry["id"])
+            _remove_queued_by_id(slot.messages, _binding_entry["id"])
+            state.broadcast_ws(
+                "queue_pop",
+                {"slot": slot.key, "content": "", "queue_id": _binding_entry["id"]},
+            )
+            slot.append(
+                "notice",
+                "ℹ️ Model-session recovery cancelled — "
+                + _retry_cancel_reason(_binding_rebound, _binding_superseded, _binding_stopped),
+                "msg msg-info",
+            )
+            logger.info(
+                "Purged stale binding recovery for slot %s "
+                "(rebound=%s stopped=%s superseded=%s)",
+                slot.key,
+                _binding_rebound,
+                _binding_stopped,
+                _binding_superseded,
+            )
+    if not slot._queue:
+        return False
+
     try:
         merge = KiroCrewConfig.load().dashboard.merge_queued_messages
     except Exception:
@@ -7191,6 +7245,22 @@ async def _start_next_queued_turn(
     _claimed_replays = replays_of(slot).claim(consumed)
     if _claimed_replays:
         _run_kwargs["_replay"] = _claimed_replays
+    if len(consumed) == 1:
+        _binding_meta = consumed[0].get("meta")
+        if isinstance(_binding_meta, dict) and _binding_meta.get("binding_recovery") is True:
+            _binding_key = _binding_meta.get("binding_session_key")
+            _binding_stop_gen = _binding_meta.get("binding_stop_generation")
+            _binding_session_stop_gen = _binding_meta.get("binding_session_stop_generation")
+            if (
+                isinstance(_binding_key, str)
+                and isinstance(_binding_stop_gen, int)
+                and isinstance(_binding_session_stop_gen, int)
+            ):
+                _run_kwargs["_binding_recovery_fence"] = (
+                    _binding_key,
+                    _binding_stop_gen,
+                    _binding_session_stop_gen,
+                )
     if is_recovery:
         _run_kwargs["_synthetic_recovery_turn"] = True
         if len(consumed) == 1 and consumed[0].get(_REPLAYS_COMPLETION_KEY) is True:
@@ -7872,6 +7942,31 @@ def _hands_off_queue_on_exit(
     return guarded
 
 
+def _retry_cancel_reason(rebound: bool, superseded: bool, stopped: bool) -> str:
+    """The cancel-notice tail for a binding recovery, in the ledger's wording."""
+    return cancel_reason(
+        ReplayRevocation(rebound=rebound, stop_moved=stopped, superseded=superseded)
+    )
+
+
+async def _finish_pre_dispatch_abort(state: DashboardState, slot: _ChatSlot) -> None:
+    """Finish an abort that happened before the outer turn lifecycle began.
+
+    Consume-seam replay validation runs before provider acquisition and the
+    ordinary ``try/finally``. Preserve pending steers, dispatch one queued user
+    successor, or mark the cycle idle without starting machine-authored
+    synthesis for a replay that never ran.
+    """
+
+    _requeue_unconsumed_steers(state, slot)
+    next_turn_started = False
+    if slot._queue:
+        state.push_slots_update()
+        next_turn_started = await _start_next_queued_turn(state, slot)
+    if not next_turn_started:
+        await _finish_queue_cycle(state, slot, allow_automatic_successor=False)
+
+
 def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
     """Emit the user-message → first-visible-token latency histogram.
 
@@ -8073,6 +8168,10 @@ async def _run_chat(
     # re-checks each claimed family before the provider sees the turn. Only the
     # queue drain sets this.
     _replay: frozenset[ReplayFamily] = frozenset(),
+    # Immutable queue-drain identity for one preserved-thinking recovery.
+    # The coroutine rechecks it before provider acquisition and again before
+    # streaming so Stop, correction, steer, or rebind always wins the race.
+    _binding_recovery_fence: "tuple[str, int, int] | None" = None,
     # The drained entry carried the synthetic-recovery ``kind`` tag (a runner
     # requeue after a pre-output failure, including a re-queue of the USER'S OWN
     # words on a poisoned-conversation discard). Structural, from the entry --
@@ -8242,6 +8341,45 @@ async def _run_chat(
 
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
+    _binding_recorded_key = (
+        _binding_recovery_fence[0] if _binding_recovery_fence is not None else ""
+    )
+    if _binding_recovery_fence is not None:
+        _binding_live_key = effective_session_key(slot)
+        _binding_rebound = bool(_binding_recorded_key) and (
+            _binding_live_key != _binding_recorded_key
+        )
+        _binding_stopped = (
+            getattr(slot, "_stop_generation", 0) != (_binding_recovery_fence[1])
+            or _session_stop_generation_for(sessions, _binding_recorded_key or _binding_live_key)
+            != _binding_recovery_fence[2]
+        )
+        _binding_superseded = bool(getattr(slot, "_pending_steers", None)) or (
+            _has_user_queued_followup(slot)
+        )
+        if (
+            _binding_rebound
+            or _binding_stopped
+            or _binding_superseded
+            or slot._stopping
+            or _should_suppress_requeue(slot)
+        ):
+            slot.append(
+                "notice",
+                "ℹ️ Model-session recovery cancelled — "
+                + _retry_cancel_reason(_binding_rebound, _binding_superseded, _binding_stopped),
+                "msg msg-info",
+            )
+            logger.info(
+                "Binding recovery aborted at consume for slot %s "
+                "(rebound=%s stopped=%s superseded=%s)",
+                slot.key,
+                _binding_rebound,
+                _binding_stopped,
+                _binding_superseded,
+            )
+            await _finish_pre_dispatch_abort(state, slot)
+            return
 
     def _session_stop_generation() -> int:
         """The session manager's Stop count for this turn's session key."""
@@ -9226,6 +9364,10 @@ async def _run_chat(
     # by the consecutive pre-stream-exhaustion branch or the typed
     # unsupported-history-image recovery in the AcpError handler below.
     needs_conversation_discard = False
+    # Only the exact binding mismatch uses durable fallback retention; the
+    # generic poisoned-session canary keeps its existing clear-SID behavior.
+    _binding_recovery_queued = False
+    _binding_recovery_queue_id = ""
     _auth_required = False
     saw_compaction = False
     # True once a compaction STARTED notice landed this turn, so the terminal
@@ -9367,6 +9509,10 @@ async def _run_chat(
     # slash command assembles nothing, so assembly must hold too. Bound at turn
     # scope so every teardown path reads a defined value.
     _first_turn_history_assembled = False
+    # A cancellation delivered during durable replay settlement must be
+    # re-raised only after the session permit and active-turn identity are
+    # released, or every later turn on this session blocks forever.
+    _replay_settlement_cancelled: asyncio.CancelledError | None = None
     # True while a member DM thread's FIRST turn is in flight: the session
     # client is allocated before the context build, so a build failure (e.g.
     # MemberRulesUnreadable aborting on a malformed rules file) leaves a warm
@@ -11652,6 +11798,43 @@ async def _run_chat(
                 depth=_prompt_depth,
             )
             return
+        # Binding recovery also spans the awaited provider/context preparation.
+        # Recheck correction, steer, and rebind synchronously beside the Stop
+        # gate before the native stream can register a turn.
+        if _binding_recovery_fence is not None:
+            _binding_pre_live_key = effective_session_key(slot)
+            _binding_pre_rebound = bool(_binding_recorded_key) and (
+                _binding_pre_live_key != _binding_recorded_key
+            )
+            _binding_pre_superseded = bool(
+                getattr(slot, "_pending_steers", None)
+            ) or _has_user_queued_followup(slot)
+            if _binding_pre_rebound or _binding_pre_superseded:
+                slot.append(
+                    "notice",
+                    "ℹ️ Model-session recovery cancelled — "
+                    + _retry_cancel_reason(
+                        _binding_pre_rebound,
+                        _binding_pre_superseded,
+                        False,
+                    ),
+                    "msg msg-info",
+                )
+                logger.info(
+                    "Aborting binding recovery for %s — intent changed during "
+                    "preparation (rebound=%s superseded=%s)",
+                    session_key,
+                    _binding_pre_rebound,
+                    _binding_pre_superseded,
+                )
+                crew_log_emit.on_turn_refused(
+                    _crew_log_sid,
+                    _crew_log_turn_no,
+                    "binding_replay_superseded_before_dispatch",
+                    _crew_log_actor,
+                    depth=_prompt_depth,
+                )
+                return
         # The consume-seam supersession check ran at turn ENTRY, but the whole
         # preparation path (session acquisition, prompt assembly) is awaited
         # between there and this point. A correction the user queued during
@@ -14767,64 +14950,75 @@ async def _run_chat(
             elif event.kind == EVENT_CLEAR_STATUS:
                 # A confirmed native clear is the one destructive slash command:
                 # replaying the persisted Kiro Crew history afterwards would undo
-                # the user's clear. Retire either an unconsumed slash lease or the
-                # consumed-turn marker before any terminal can re-arm it.
-                if _replay_pending or _replay_accepted_this_turn:
-                    state.sessions.commit_provider_switch_replay_sid(session_key)
-                if _replay_pending:
-                    state.sessions.consume_provider_switch_replay(session_key)
-                    _replay_pending = False
-                _replay_accepted_this_turn = False
-                # The FRESH first-turn history debt is armed before the slash
-                # branch, and a slash turn never reaches the context-assembly
-                # settle, so retire it here too: a fresh `/clear` otherwise leaves
-                # the debt armed and the next ordinary prompt rebuilds the very
-                # history the user asked to drop.
-                state.sessions.consume_first_turn_history_owed(session_key)
-                # Advance the durable POSITION base by the rows this clear
-                # evicts, exactly as the trim path does (`_ChatSlot.append`)
-                # and as every restore path recomputes it. The base plus the
-                # window's durable rows is the crew log turn ordinal and the
-                # session_control `since` cursor space; emptying the window
-                # without crediting the base made the next turn draw an
-                # ordinal an earlier turn already wrote (two unrelated turns
-                # then read as one turn with contradictory entries) and shifted
-                # every cursor down. `durable_row_count` is the ONE shared
-                # counting rule, so the base cannot disagree with the ordinal
-                # about which rows are durable. Counted BEFORE the clear --
-                # afterwards the rows are gone.
-                slot._disk_older_durable_count += durable_row_count(slot.messages)
-                slot.messages.clear()
-                # The boundary was captured against the pre-clear message
-                # count; the list is now empty, so reset it to 0 or the
-                # clear-confirmation appended below would fall outside the
-                # turn-stats scan slice and the completed turn would drop its
-                # elapsed/credits stats.
-                _turn_msg_boundary = 0
-                _turn_start_mid = ""
-                assistant_text = ""
-                _wsred.reset()
-                _produced_visible_output = True
-                # slot_clear FIRST: it wipes the client's message list, so the
-                # confirmation row must be delivered after it on every path
-                # (append's own broadcast and the reader-suppressed frame alike)
-                # or the wipe erases the confirmation it announces.
-                state.broadcast_ws("slot_clear", {"slot": slot.key})
-                # /clear abandons the plan too. Keeping the pill would make the
-                # next cold start rebuild the cleared checklist into the fresh
-                # conversation (todo_recovery_prompt), so the person could never
-                # shed it.
-                # Not on an ownerless frame: a shared runtime fans those out to
-                # every peer runner, and a peer's checklist is not what this
-                # session's /clear cleared.
-                # Gated on THIS turn being the /clear, not on frame ownership: a
-                # shared runtime marks the frame ownerless whenever a subagent is
-                # registered, which is also true for the session that typed it.
-                if _this_turn_is_clear and slot.set_todo(None):
-                    state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
-                append_and_surface(
-                    state, slot, "assistant", "🗑️ Conversation cleared.", "msg msg-a"
-                )
+                # the user's clear. The provider has ALREADY deleted history before
+                # this event arrives, so deletion wins even when durable settlement
+                # fails or is cancelled. The nested finally retires the in-memory
+                # lease and clears the visible window on every exit path.
+                _clear_owes_replay_retirement = _replay_pending or _replay_accepted_this_turn
+                try:
+                    if _clear_owes_replay_retirement:
+                        await state.sessions.acommit_provider_switch_replay_sid(session_key)
+                finally:
+                    try:
+                        if _clear_owes_replay_retirement:
+                            state.sessions.consume_provider_switch_replay(session_key)
+                    finally:
+                        _replay_pending = False
+                        _replay_accepted_this_turn = False
+                        # The FRESH first-turn history debt is armed before the slash
+                        # branch, and a slash turn never reaches the context-assembly
+                        # settle, so retire it here too: a fresh `/clear` otherwise leaves
+                        # the debt armed and the next ordinary prompt rebuilds the very
+                        # history the user asked to drop.
+                        state.sessions.consume_first_turn_history_owed(session_key)
+                        # Advance the durable POSITION base by the rows this clear
+                        # evicts, exactly as the trim path does (`_ChatSlot.append`)
+                        # and as every restore path recomputes it. The base plus the
+                        # window's durable rows is the crew log turn ordinal and the
+                        # session_control `since` cursor space; emptying the window
+                        # without crediting the base made the next turn draw an
+                        # ordinal an earlier turn already wrote (two unrelated turns
+                        # then read as one turn with contradictory entries) and shifted
+                        # every cursor down. `durable_row_count` is the ONE shared
+                        # counting rule, so the base cannot disagree with the ordinal
+                        # about which rows are durable. Counted BEFORE the clear --
+                        # afterwards the rows are gone.
+                        slot._disk_older_durable_count += durable_row_count(slot.messages)
+                        slot.messages.clear()
+                        # The boundary was captured against the pre-clear message
+                        # count; the list is now empty, so reset it to 0 or the
+                        # clear-confirmation appended below would fall outside the
+                        # turn-stats scan slice and the completed turn would drop its
+                        # elapsed/credits stats.
+                        _turn_msg_boundary = 0
+                        _turn_start_mid = ""
+                        assistant_text = ""
+                        _wsred.reset()
+                        _produced_visible_output = True
+                        # slot_clear FIRST: it wipes the client's message list, so the
+                        # confirmation row must be delivered after it on every path
+                        # (append's own broadcast and the reader-suppressed frame alike)
+                        # or the wipe erases the confirmation it announces.
+                        state.broadcast_ws("slot_clear", {"slot": slot.key})
+                        # /clear abandons the plan too. Keeping the pill would make the
+                        # next cold start rebuild the cleared checklist into the fresh
+                        # conversation (todo_recovery_prompt), so the person could never
+                        # shed it.
+                        # Not on an ownerless frame: a shared runtime fans those out to
+                        # every peer runner, and a peer's checklist is not what this
+                        # session's /clear cleared.
+                        # Gated on THIS turn being the /clear, not on frame ownership: a
+                        # shared runtime marks the frame ownerless whenever a subagent is
+                        # registered, which is also true for the session that typed it.
+                        if _this_turn_is_clear and slot.set_todo(None):
+                            state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
+                        append_and_surface(
+                            state,
+                            slot,
+                            "assistant",
+                            "🗑️ Conversation cleared.",
+                            "msg msg-a",
+                        )
             elif event.kind == EVENT_AGENT_SWITCHED:
                 new_agent, _ = redact_credentials(event.text)
                 new_agent, _ = redact_exfiltration_urls(new_agent)
@@ -17352,6 +17546,85 @@ async def _run_chat(
         # must stay owed, so the debt correctly stays armed (GPT 6.1 F1).
         _stop_reason = STOP_REASON_CANCELLED
         await _persist_partial_reply(_cancel_reason)
+    except AcpConversationBindingMismatch as exc:
+        _crew_log_error = type(exc).__name__
+        await _persist_partial_reply("error: thinking binding mismatch")
+        logger.warning(
+            "ACP preserved-thinking binding mismatch in slot %s; considering fresh conversation",
+            slot.key,
+        )
+        recoverable = (
+            _prompt_depth == 0
+            and not _turn_emitted
+            and not _turn_thought
+            and _turn_tool_calls == 0
+            and not slot._poisoned_reset_used
+            and not _should_suppress_requeue(slot)
+            and not _stop_pressed()
+            and not _has_user_queued_followup(slot)
+            and not getattr(slot, "_pending_steers", None)
+        )
+        attached = False
+        if recoverable:
+            attached = await subagents_attached_async(
+                state, slot, session_key, "thinking_binding_recovery"
+            )
+            recoverable = not attached
+        # The child probe yields. Re-read every user-intent signal before
+        # mutating the queue or scheduling a destructive conversation discard.
+        if recoverable:
+            recoverable = (
+                not _should_suppress_requeue(slot)
+                and not _stop_pressed()
+                and not _has_user_queued_followup(slot)
+                and not getattr(slot, "_pending_steers", None)
+                and effective_session_key(slot) == session_key
+            )
+        if recoverable:
+            slot._poisoned_reset_used = True
+            needs_conversation_discard = True
+            _binding_recovery_queued = True
+            replay_meta: dict[str, Any]
+            if _attachment_meta:
+                replay_meta = {key: list(paths) for key, paths in _attachment_meta.items()}
+            elif _attachments:
+                replay_meta = {"files": list(_attachments)}
+            else:
+                replay_meta = {}
+            replay_meta.update(
+                {
+                    "binding_recovery": True,
+                    "binding_session_key": session_key,
+                    "binding_stop_generation": getattr(slot, "_stop_generation", 0),
+                    "binding_session_stop_generation": _session_stop_generation(),
+                }
+            )
+            _binding_recovery_queue_id = _queue_recovery(
+                0,
+                message,
+                kind=SYNTHETIC_RECOVERY_KIND,
+                payload=payload_for_replay(_is_synthetic),
+                extra_meta=replay_meta,
+            )
+            slot.append(
+                "error",
+                "⟳ Preserved model reasoning no longer matches this conversation — "
+                "rebuilding the model session from this chat and retrying once…",
+                "msg msg-err",
+                meta={"kind": TRANSIENT_RETRY_KIND},
+            )
+        else:
+            reason = (
+                "attached sub-agents are still using it"
+                if attached
+                else "the turn was stopped or superseded"
+            )
+            slot.append(
+                "error",
+                "❌ The model session could not be rebuilt safely because "
+                f"{reason}. Re-send the request when the session is idle.",
+                "msg msg-err",
+            )
     except AcpAuthRequired as exc:
         # The signed-out CLI is discovered HERE, not by a probe: this is the
         # authoritative logout signal now that readiness is latched at boot.
@@ -18941,15 +19214,25 @@ async def _run_chat(
             try:
                 _replay_landed = (
                     _turn_landed
-                    and _stop_reason == STOP_REASON_END_TURN
+                    and _saw_terminal_event
+                    and _stop_reason in (None, "", STOP_REASON_END_TURN)
                     and not _terminal_synthetic
                     and not _had_empty_response_verdict
                 )
                 if _replay_landed:
-                    if not state.sessions.commit_provider_switch_replay_sid(session_key):
+                    if not await state.sessions.acommit_provider_switch_replay_sid(session_key):
                         state.sessions.mark_provider_switch_replay(session_key)
                 else:
                     state.sessions.mark_provider_switch_replay(session_key)
+            except asyncio.CancelledError as exc:
+                _replay_settlement_cancelled = exc
+                try:
+                    state.sessions.mark_provider_switch_replay(session_key)
+                except Exception:
+                    logger.debug(
+                        "re-arming replay after settlement cancellation failed",
+                        exc_info=True,
+                    )
             except Exception:
                 logger.debug("settling replay SID failed", exc_info=True)
                 try:
@@ -19117,19 +19400,38 @@ async def _run_chat(
                 # the slot at "unknown" rather than carrying a verdict it can no
                 # longer vouch for.
                 slot.forget_session_model_state()
+                teardown_ok = True
                 try:
                     if needs_conversation_discard:
-                        # Poisoned-conversation escalation: clear ONLY the
-                        # resume sid (keeping the session-map entry with its
-                        # Slack thread/channel linkage), so the re-queued
-                        # recovery turn cold-starts a fresh native
-                        # conversation instead of session/load-ing the same
-                        # rejected one (which reset() would do).
-                        await state.sessions.discard_conversation(session_key)
+                        teardown_ok = (
+                            await state.sessions.discard_conversation(
+                                session_key,
+                                preserve_replay_fallback=_binding_recovery_queued,
+                            )
+                            is True
+                        )
                     else:
-                        await state.sessions.reset(session_key)
+                        teardown_ok = await state.sessions.reset(session_key) is True
                 except Exception:
+                    teardown_ok = False
                     logger.warning("Failed to reset session %s after agent switch", session_key)
+                if _binding_recovery_queued and not teardown_ok:
+                    if _binding_recovery_queue_id:
+                        slot.queue_remove_by_id(_binding_recovery_queue_id)
+                        _remove_queued_by_id(slot.messages, _binding_recovery_queue_id)
+                        state.broadcast_ws(
+                            "queue_pop",
+                            {
+                                "slot": slot.key,
+                                "content": "",
+                                "queue_id": _binding_recovery_queue_id,
+                            },
+                        )
+                    slot.append(
+                        "error",
+                        "❌ The model session could not be rebuilt; the retry was cancelled.",
+                        "msg msg-err",
+                    )
                 # Freshness push for open tabs. Unconditional where the old
                 # write-time retirement needed an outcome gate: the helper
                 # re-resolves the live child at call time, so a swallowed
@@ -19162,6 +19464,8 @@ async def _run_chat(
             # has something to retire.
             if slot._active_turn_session_key == session_key:
                 slot._active_turn_session_key = ""
+            if _replay_settlement_cancelled is not None:
+                raise _replay_settlement_cancelled
             # Spelling-independent backstop for a directive call whose tool
             # identity and result marker were both lost by the backend. The
             # validated payload reached the gateway, but no frame claimed it,
