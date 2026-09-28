@@ -230,7 +230,12 @@ def consumed_in(phase: ConsumePhase) -> tuple[ReplayFamily, ...]:
     return tuple(family for family, policy in POLICIES.items() if policy.consume_phase == phase)
 
 
-def _cancel_reason(revocation: ReplayRevocation) -> str:
+def cancel_reason(revocation: ReplayRevocation) -> str:
+    """The tail of a "retry cancelled" notice, naming why the replay was dropped.
+
+    Shared with replays that are not ledger families (the preserved-thinking
+    binding recovery) so every cancelled retry explains itself in one wording.
+    """
     # A rebind reads as a move only when the replay was neither superseded nor
     # stopped; a newer message outranks a Stop.
     if revocation.rebound and not (revocation.superseded or revocation.stopped):
@@ -254,7 +259,7 @@ def cancel_notice(family: ReplayFamily, revocation: ReplayRevocation) -> str:
         return "ℹ️ Auto-continue cancelled — the turn was stopped, nothing was run."
     policy = POLICIES[family]
     if policy.label:
-        return f"ℹ️ {policy.label} retry cancelled — " + _cancel_reason(revocation)
+        return f"ℹ️ {policy.label} retry cancelled — " + cancel_reason(revocation)
     return policy.notice
 
 
