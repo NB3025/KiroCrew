@@ -398,6 +398,17 @@ def test_desktop_matrix_does_not_request_pull_request_api_permission() -> None:
     assert permissions == {"contents": "read"}
 
 
+def test_desktop_matrix_full_history_checkout_is_time_bounded() -> None:
+    """A hung full-history fetch must not hold every desktop leg for 6 hours.
+
+    Same budget as ci.yml's ``changes`` job: long enough for a slow runner's
+    ``fetch-depth: 0`` checkout, short of the 360-minute runner default.
+    """
+    workflow = yaml.safe_load((WORKFLOWS / "build.yml").read_text(encoding="utf-8"))
+
+    assert workflow["jobs"]["desktop-matrix"]["timeout-minutes"] == 15
+
+
 def test_pr_linux_desktop_artifacts_are_arch_qualified() -> None:
     """Two Linux legs both match ``runner.os == 'Linux'``.
 

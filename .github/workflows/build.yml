@@ -270,6 +270,11 @@ jobs:
   desktop-matrix:
     name: Resolve desktop matrix
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    # Same budget as ci.yml's `changes` job (#13126): the PR-only
+    # `fetch-depth: 0` checkout below is a full-history fetch of a large
+    # repository, so a slow runner needs minutes, but a hung fetch must not
+    # hold every desktop leg for the 6-hour default.
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
