@@ -695,6 +695,26 @@ def _resolve_compact_wait_secs(configured: float) -> float:
     return configured if configured > 0 else COMPACT_WAIT_TIMEOUT_SECS
 
 
+def compact_wait_budget_secs() -> float:
+    """The compaction wait budget in force NOW, for a manual ``/compact``.
+
+    The manual entry points (dashboard ``/compact``, every chat channel's
+    compact command and its near-limit compaction) hold no manager config, so
+    they read the
+    live-config watcher's snapshot instead -- a plain attribute read, safe on
+    the event loop -- and resolve it exactly as the automatic coordinator
+    resolves its own copy. Read per call, so a live config change applies to
+    the next compaction. An unarmed watcher (a process that never started one,
+    or the seconds before the gateway primes it) has no snapshot and keeps the
+    built-in ``COMPACT_WAIT_TIMEOUT_SECS``; there is deliberately no disk
+    fallback, because a load here would block the event loop.
+    """
+    cfg = live.snapshot()
+    if cfg is None:
+        return COMPACT_WAIT_TIMEOUT_SECS
+    return _resolve_compact_wait_secs(cfg.session.compact_wait_secs)
+
+
 # After a failed compact, suppress auto-compaction for this many seconds so a
 # broken /compact does not fire on every subsequent turn.
 _COMPACT_FAILURE_COOLDOWN_SECS = 60.0
@@ -1993,9 +2013,7 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: _resolve_compact_wait_secs(
-                    self._cfg.session.compact_wait_secs
-                ),
+                compact_wait_timeout_secs=lambda: self.compact_wait_budget_secs(),
                 compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
                     elapsed, budget
                 ),
@@ -2674,6 +2692,19 @@ class SessionManager:
             yield
         finally:
             boundary.end_ending(key)
+
+    def compact_wait_budget_secs(self) -> float:
+        """The compaction wait budget this manager's config is in force with.
+
+        The automatic coordinator and any caller that compacts a session it
+        opened through this manager (the task runner's context-overflow
+        compaction) resolve ``session.compact_wait_secs`` here. The manager's
+        config is the one the process booted with, re-adopted on every live
+        change, so this holds in a standalone ``kirocrew run`` too, where no
+        live-config watcher is armed and ``compact_wait_budget_secs()`` would
+        fall back to the built-in budget.
+        """
+        return _resolve_compact_wait_secs(self._cfg.session.compact_wait_secs)
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""

@@ -33,6 +33,7 @@ from kiro_crew.messaging.link import (
     release_conversation_location,
 )
 from kiro_crew.messaging.session_resume import ResumeReleaseError
+from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.telegram.commands import parse_dashboard_argument
 from kiro_crew.telegram.renderer import md_to_telegram_html_safe
@@ -499,7 +500,7 @@ async def _handle_compact(
             # branch is unreachable and a slow-but-healthy session gets
             # destroyed by the outer TimeoutError.
             await asyncio.wait_for(provider.compact(), timeout=120)
-            cr = await provider.wait_for_compaction()
+            cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
             if cr["type"] == "completed":
                 # ``summary`` is model-facing compacted context, not a
                 # user-facing receipt. Never publish its orchestration text.

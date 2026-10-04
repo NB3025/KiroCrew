@@ -35,6 +35,7 @@ class FakeProvider:
         self.steered: list[str] = []
         self._active = active
         self.compacted = 0
+        self.wait_timeouts: list[float] = []
         self.compact_result: dict[str, str] = {"type": "completed", "summary": ""}
 
     def has_active_turn(self) -> bool:
@@ -47,7 +48,8 @@ class FakeProvider:
     async def compact(self) -> None:
         self.compacted += 1
 
-    async def wait_for_compaction(self) -> dict[str, str]:
+    async def wait_for_compaction(self, timeout: float = 300.0) -> dict[str, str]:
+        self.wait_timeouts.append(timeout)
         return self.compact_result
 
 
@@ -215,6 +217,24 @@ class TestCompact:
         assert provider.compacted == 1
         assert sessions.released == [key]
         assert "compacted" in client.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_compact_waits_the_configured_budget(self, monkeypatch) -> None:
+        # A manual /compact waits ``session.compact_wait_secs`` from the live
+        # config, not the provider's built-in default.
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.session.compact_wait_secs = 900.0
+        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+        dispatcher, _client, sessions = _dispatcher()
+        key = dispatcher._session_key(HANDLE)
+        provider = FakeProvider()
+        sessions.providers[key] = provider
+        sessions.sessions.add(key)
+        await dispatcher.handle_message(_inbound("/compact"))
+        assert provider.wait_timeouts == [900.0]
 
     @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:

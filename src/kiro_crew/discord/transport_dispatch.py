@@ -137,7 +137,7 @@ from kiro_crew.security import (
     redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session import SessionBusyError
+from kiro_crew.session import SessionBusyError, compact_wait_budget_secs
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.stats import Stats
@@ -3034,7 +3034,7 @@ class DiscordDispatcher:
                 # branch is unreachable and a slow-but-healthy session gets
                 # destroyed by the outer TimeoutError.
                 await asyncio.wait_for(provider.compact(), timeout=120)
-                cr = await provider.wait_for_compaction()
+                cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
                 if cr["type"] == "completed":
                     # ``summary`` is model-facing compacted context, not a
                     # user-facing receipt. Never publish its orchestration text.
