@@ -1813,12 +1813,17 @@ class SessionConfig:
         default=0.0,
         metadata=_meta(
             "Compaction Wait Budget",
-            "Seconds the automatic-compaction coordinator waits for a "
-            "compaction to finish before giving up and restarting the "
-            "session. 0 (the default) uses the built-in budget. A positive "
-            "value below 60 is raised to 60 and a value above 3600 is capped. "
-            "Raise it on a host where automatic compaction on a large context "
-            "window regularly needs longer than the built-in budget.",
+            "Seconds to wait for a compaction to finish: automatic, the task "
+            "runner's context-overflow compaction, and a manual /compact on "
+            "any surface. Past it, the session manager's automatic compaction "
+            "and the task runner's compaction restart the session, a chat "
+            "channel's near-limit compaction gives up and keeps the session, "
+            "and a manual /compact reports that it timed out. 0 (the default) "
+            "uses the built-in budget. A positive value "
+            "below 60 is raised to 60 and a value above 3600 is capped. Raise "
+            "it on a host where compaction on a large context window regularly "
+            "needs longer than the built-in budget; a stuck compaction also "
+            "waits the full budget.",
         ),
     )
     pool_size: int = field(

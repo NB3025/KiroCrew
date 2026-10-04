@@ -191,12 +191,15 @@ CHAT_TURN_TIMEOUT = 14400.0
 # overrides it and is clamped below the turn ceiling at load time.
 TOOL_APPROVAL_TIMEOUT = 600.0
 
-# How long any caller waits for a compaction to report completed/failed —
-# the default of ``LLMProvider.wait_for_compaction`` and the cap on the
-# automatic context-threshold compaction in ``session.py``. Manual (/compact,
-# !compact) and automatic compaction deliberately share this single budget:
-# the operation is identical, so a shorter manual budget only reports
-# "timed out" on work that is still running and subsequently succeeds.
+# How long any caller waits for a compaction to report completed/failed when
+# ``session.compact_wait_secs`` is unset (0) -- the default of
+# ``LLMProvider.wait_for_compaction``. Manual (/compact, !compact, channel
+# commands) and automatic compaction deliberately share one budget: the
+# operation is identical, so a shorter manual budget only reports "timed out"
+# on work that is still running and subsequently succeeds. A configured key
+# raises both: the automatic coordinator and the task runner's context-overflow
+# compaction resolve it from the session manager's config, and every dashboard
+# and channel call site passes ``session.compact_wait_budget_secs()``.
 COMPACT_WAIT_TIMEOUT_SECS = 300.0
 
 # Wall-clock ceiling on one subagent execution: the default of

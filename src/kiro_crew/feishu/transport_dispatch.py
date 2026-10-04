@@ -62,6 +62,7 @@ from kiro_crew.messaging.link import (
 )
 from kiro_crew.messaging.pre_turn import resolve_pre_turn
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.start_priority import person_priority
 
 if TYPE_CHECKING:
@@ -361,7 +362,7 @@ class FeishuDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction()
+            cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
             if cr["type"] == "completed":
                 await self.client.send_reply(inbound.message_id, "🗜️ 已压缩上下文。")
             elif cr["type"] == "failed":
@@ -475,7 +476,7 @@ class FeishuDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction()
+                cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
                 if cr["type"] == "completed":
                     await self.client.send_reply(
                         inbound.message_id, "🗜️ 上下文接近上限，已自动压缩。"

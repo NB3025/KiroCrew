@@ -99,6 +99,7 @@ from kiro_crew.messaging.queue_drain import (
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface, receipt_address_key
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.sel import sel
+from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.session_lifecycle import (
     STOP_DECLINED_COMPACTING_TEXT,
     compaction_in_flight,
@@ -1985,7 +1986,7 @@ class WebexDispatcher:
         """
         try:
             await asyncio.wait_for(provider.compact(), timeout=_COMPACT_TIMEOUT_S)
-            result = await provider.wait_for_compaction()
+            result = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
         except asyncio.TimeoutError:
             logger.warning("Webex: compaction timed out after %.0fs", _COMPACT_TIMEOUT_S)
             return False, "timed out"
