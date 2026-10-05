@@ -569,7 +569,6 @@ from kiro_crew.session import (
     SessionClosingError,
     SessionEndingError,
     SpeculativeResumeRefused,
-    compact_wait_budget_secs,
 )
 from kiro_crew.session_agent_selection import (  # noqa: F401
     record_agent_selection,
@@ -15705,7 +15704,7 @@ async def _run_chat(
                 # kiro-cli fires compaction asynchronously after EVENT_COMPLETE —
                 # just wait for the result without sending another prompt.
                 compaction_result = await client.wait_for_compaction(
-                    timeout=compact_wait_budget_secs()
+                    timeout=state.sessions.compact_wait_budget_secs()
                 )
                 logger.info("Deferred compaction result: %s", compaction_result)
                 if compaction_result["type"] == "completed":

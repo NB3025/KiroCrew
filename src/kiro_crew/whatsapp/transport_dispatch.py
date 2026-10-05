@@ -43,7 +43,6 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.session_lifecycle import (
     STOP_DECLINED_COMPACTING_TEXT,
     compaction_in_flight,
@@ -370,7 +369,9 @@ class WhatsAppDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
             if cr["type"] == "completed":
                 await self._say(scope, COMPACTED_TEXT)
             elif cr["type"] == "failed":
@@ -668,7 +669,9 @@ class WhatsAppDispatcher:
             self._conv.clear_awaiting(scope)
             try:
                 await provider.compact()
-                result = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+                result = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
                 kind = result["type"]
             except Exception:  # noqa: BLE001: the reply already landed
                 logger.debug("whatsapp: hard-threshold compaction failed", exc_info=True)

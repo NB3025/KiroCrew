@@ -1076,9 +1076,9 @@ async def execute_task(
             )
             try:
                 await client.compact()
-                # The manager's budget, not the live snapshot: a standalone
-                # `kirocrew run` arms no live-config watcher, and this session
-                # was opened through `sessions`, whose config it booted with.
+                # The manager's budget, the one resolver every caller uses; it
+                # holds in a standalone `kirocrew run`, which arms no
+                # live-config watcher.
                 compact_result = await client.wait_for_compaction(
                     timeout=sessions.compact_wait_budget_secs()
                 )

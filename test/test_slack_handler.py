@@ -208,6 +208,10 @@ class FakeSessionManager:
             await on_hard()
         return outcome
 
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
+
 
 class TestHandleMessage:
     @pytest.mark.asyncio

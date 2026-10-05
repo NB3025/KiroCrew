@@ -253,7 +253,7 @@ def test_no_call_site_pins_a_shorter_wait():
     """Regression guard: no production call site may pass an
     explicit numeric-literal timeout below the shared budget — keyword or
     positional, int or float. Call sites pass the resolved budget instead of
-    restating it. Non-literal arguments (``compact_wait_budget_secs()``,
+    restating it. Non-literal arguments (``sessions.compact_wait_budget_secs()``,
     session.py's remaining-budget variable) are intentionally exempt:
     they are derived from the shared budget and covered by the tests above.
     """
@@ -286,44 +286,29 @@ def test_no_call_site_pins_a_shorter_wait():
                     )
     assert not offenders, (
         "Compaction wait shorter than the shared budget reintroduced (pass "
-        f"timeout=compact_wait_budget_secs() instead of a literal): {offenders}"
+        f"timeout=sessions.compact_wait_budget_secs() instead of a literal): {offenders}"
     )
 
 
-# ── Manual call sites honour the configured budget ────────────
+# ── Every call site honours the configured budget ─────────────
 #
-# The automatic coordinator resolves ``session.compact_wait_secs`` from the
-# manager's config, and so does the task runner's context-overflow compaction,
-# through ``SessionManager.compact_wait_budget_secs()``. A manual /compact
-# (dashboard, chat channels) and a channel's near-limit compaction hold no
-# manager config, so they resolve the same key from the live-config snapshot
-# through ``compact_wait_budget_secs()``. A call site that leans on the
-# provider's default instead waits the built-in budget whatever the operator
-# set.
+# One resolver: ``SessionManager.compact_wait_budget_secs()``. The automatic
+# coordinator, the task runner's context-overflow compaction, the dashboard
+# /compact and every chat channel's compact command and near-limit compaction
+# all hold the session manager and read the budget there, so no caller can
+# resolve ``session.compact_wait_secs`` differently (a second, live-snapshot
+# resolver fell back to the built-in budget wherever no watcher was armed). A
+# call site that leans on the provider's default instead waits the built-in
+# budget whatever the operator set.
 
 
-def test_manual_budget_without_a_live_snapshot_is_built_in(monkeypatch):
-    """No armed watcher means no snapshot: the built-in budget, no disk read."""
-    from kiro_crew.config import live
-    from kiro_crew.session import compact_wait_budget_secs
+def test_there_is_one_budget_resolver():
+    """No module-level resolver sits beside the manager's: a second one is
+    the drift the single method exists to prevent."""
+    import kiro_crew.session as session_mod
 
-    monkeypatch.setattr(live, "snapshot", lambda: None)
-    assert compact_wait_budget_secs() == COMPACT_WAIT_TIMEOUT_SECS
-
-
-def test_manual_budget_follows_the_live_snapshot(monkeypatch):
-    """The 0 sentinel keeps the built-in budget, a positive value is used, and
-    the key is read per call, so a live change reaches the next compaction."""
-    from kiro_crew.config import live
-    from kiro_crew.config.loader import KiroCrewConfig
-    from kiro_crew.session import compact_wait_budget_secs
-
-    cfg = KiroCrewConfig()
-    monkeypatch.setattr(live, "snapshot", lambda: cfg)
-    assert compact_wait_budget_secs() == COMPACT_WAIT_TIMEOUT_SECS
-
-    cfg.session.compact_wait_secs = 900.0
-    assert compact_wait_budget_secs() == 900.0
+    assert not hasattr(session_mod, "compact_wait_budget_secs")
+    assert callable(session_mod.SessionManager.compact_wait_budget_secs)
 
 
 #: Variables a production call may pass that already hold a resolved budget:
@@ -343,8 +328,12 @@ def _sanctioned_budget(arg: ast.expr, enclosing: str | None) -> bool:
     constant itself (``COMPACT_WAIT_TIMEOUT_SECS``) and any other expression all
     restate a fixed budget that never sees the key.
     """
-    if isinstance(arg, ast.Call) and _call_name(arg.func) == "compact_wait_budget_secs":
-        return True  # module function or SessionManager method
+    if (
+        isinstance(arg, ast.Call)
+        and isinstance(arg.func, ast.Attribute)
+        and arg.func.attr == "compact_wait_budget_secs"
+    ):
+        return True  # the SessionManager method, the one resolver
     if isinstance(arg, ast.Name):
         # A delegating implementation forwards its own ``timeout`` parameter.
         if arg.id == "timeout" and enclosing == "wait_for_compaction":
@@ -357,9 +346,9 @@ def test_every_call_site_passes_a_configurable_budget():
     """Regression guard: every production ``wait_for_compaction`` call passes a
     budget derived from ``session.compact_wait_secs``. Relying on the provider
     default, or passing ``COMPACT_WAIT_TIMEOUT_SECS`` or any literal explicitly,
-    waits the built-in budget whatever the operator set. A manual site passes
-    ``compact_wait_budget_secs()``, a caller holding the session manager passes
-    ``sessions.compact_wait_budget_secs()``, and the coordinator passes its own
+    waits the built-in budget whatever the operator set. Every caller holds the
+    session manager and passes ``sessions.compact_wait_budget_secs()`` (a bare
+    module-level resolver is refused), and the coordinator passes its own
     resolved budget."""
     offenders: list[str] = []
     root = src_root()
@@ -383,8 +372,8 @@ def test_every_call_site_passes_a_configurable_budget():
                     offenders.append(f"{where} (timeout={ast.unparse(arg)})")
     assert not offenders, (
         "wait_for_compaction() called with a budget that ignores "
-        "session.compact_wait_secs; pass timeout=compact_wait_budget_secs() "
-        f"(or the session manager's): {offenders}"
+        "session.compact_wait_secs; pass the session manager's "
+        f"timeout=sessions.compact_wait_budget_secs(): {offenders}"
     )
 
 
@@ -400,8 +389,9 @@ def test_guard_rejects_the_built_in_constant_and_literals():
     assert not _sanctioned_budget(arg("constants.COMPACT_WAIT_TIMEOUT_SECS"), "handler")
     assert not _sanctioned_budget(arg("900.0"), "handler")
     assert not _sanctioned_budget(arg("timeout"), "handler")
+    assert not _sanctioned_budget(arg("compact_wait_budget_secs()"), "handler")
     assert _sanctioned_budget(arg("timeout"), "wait_for_compaction")
-    assert _sanctioned_budget(arg("compact_wait_budget_secs()"), "handler")
+    assert _sanctioned_budget(arg("self.sessions.compact_wait_budget_secs()"), "handler")
     assert _sanctioned_budget(arg("sessions.compact_wait_budget_secs()"), "handler")
 
 
@@ -423,8 +413,9 @@ def test_manager_budget_follows_its_config():
 
 def test_task_runner_overflow_compaction_uses_the_manager_budget():
     """The task runner's context-overflow compaction waits the session
-    manager's budget, not the live snapshot: a standalone ``kirocrew run`` arms
-    no live-config watcher, so ``compact_wait_budget_secs()`` would wait the
+    manager's budget, which holds in a standalone ``kirocrew run`` too: that
+    process arms no live-config watcher, so a snapshot-based budget would wait
+    the
     built-in budget there whatever the config file says."""
     import kiro_crew.task_executor as task_executor_mod
 

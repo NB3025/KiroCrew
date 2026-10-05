@@ -59,7 +59,6 @@ from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.queue_drain import entries_queued_by, owner_token
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.safety_override import safety_override
-from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.session_lifecycle import (
     STOP_DECLINED_COMPACTING_TEXT,
     compaction_in_flight,
@@ -657,7 +656,9 @@ class WeixinDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
                 if cr["type"] == "completed":
                     await self._say(user_id, _AUTO_COMPACTED)
                 else:
@@ -696,7 +697,9 @@ class WeixinDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
             if cr["type"] == "completed":
                 await self._say(user_id, _COMPACT_DONE)
             elif cr["type"] == "failed":

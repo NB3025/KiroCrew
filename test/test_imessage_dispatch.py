@@ -67,6 +67,11 @@ class FakeSessions:
         self.acquire_ok = True
         self.usage_pct = 0.0
         self.reserved_generations: list[str] = []
+        self.compact_wait_secs = 300.0
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs``."""
+        return self.compact_wait_secs
 
     def is_busy(self, key: str) -> bool:
         return key in self.busy
@@ -219,16 +224,11 @@ class TestCompact:
         assert "compacted" in client.sent[0]
 
     @pytest.mark.asyncio
-    async def test_compact_waits_the_configured_budget(self, monkeypatch) -> None:
-        # A manual /compact waits ``session.compact_wait_secs`` from the live
-        # config, not the provider's built-in default.
-        from kiro_crew.config import live
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        cfg = KiroCrewConfig()
-        cfg.session.compact_wait_secs = 900.0
-        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+    async def test_compact_waits_the_configured_budget(self) -> None:
+        # A manual /compact waits the session manager's resolved
+        # ``session.compact_wait_secs``, not the provider's built-in default.
         dispatcher, _client, sessions = _dispatcher()
+        sessions.compact_wait_secs = 900.0
         key = dispatcher._session_key(HANDLE)
         provider = FakeProvider()
         sessions.providers[key] = provider

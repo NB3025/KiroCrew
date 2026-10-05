@@ -92,7 +92,6 @@ from kiro_crew.messaging.session_resume import refused_resume_is_restricted
 from kiro_crew.messaging.upload_gate import session_is_restricted
 from kiro_crew.safety_override import safety_override
 from kiro_crew.sel import sel
-from kiro_crew.session import compact_wait_budget_secs
 from kiro_crew.start_priority import person_priority
 from kiro_crew.teams.approvals import TeamsApprovalDecider
 from kiro_crew.teams.attachments import append_attachment_context, process_teams_attachments
@@ -1536,7 +1535,9 @@ class TeamsDispatcher:
                 await provider.compact()
                 # A failed or timed-out compaction is a RETURNED result, not an
                 # exception, so the notice is posted only for a completed one.
-                cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
                 if cr["type"] == "completed":
                     await self._reply(
                         inbound,
@@ -1590,7 +1591,9 @@ class TeamsDispatcher:
             await provider.compact()
             # Failure and timeout come back as the result's ``type``, not as an
             # exception, so the receipt is read off it rather than assumed.
-            cr = await provider.wait_for_compaction(timeout=compact_wait_budget_secs())
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
             if cr["type"] == "completed":
                 await self._reply(inbound, "🗜️ Context compacted.")
             elif cr["type"] == "failed":

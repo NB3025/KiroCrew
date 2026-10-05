@@ -695,26 +695,6 @@ def _resolve_compact_wait_secs(configured: float) -> float:
     return configured if configured > 0 else COMPACT_WAIT_TIMEOUT_SECS
 
 
-def compact_wait_budget_secs() -> float:
-    """The compaction wait budget in force NOW, for a manual ``/compact``.
-
-    The manual entry points (dashboard ``/compact``, every chat channel's
-    compact command and its near-limit compaction) hold no manager config, so
-    they read the
-    live-config watcher's snapshot instead -- a plain attribute read, safe on
-    the event loop -- and resolve it exactly as the automatic coordinator
-    resolves its own copy. Read per call, so a live config change applies to
-    the next compaction. An unarmed watcher (a process that never started one,
-    or the seconds before the gateway primes it) has no snapshot and keeps the
-    built-in ``COMPACT_WAIT_TIMEOUT_SECS``; there is deliberately no disk
-    fallback, because a load here would block the event loop.
-    """
-    cfg = live.snapshot()
-    if cfg is None:
-        return COMPACT_WAIT_TIMEOUT_SECS
-    return _resolve_compact_wait_secs(cfg.session.compact_wait_secs)
-
-
 # After a failed compact, suppress auto-compaction for this many seconds so a
 # broken /compact does not fire on every subsequent turn.
 _COMPACT_FAILURE_COOLDOWN_SECS = 60.0
@@ -2696,13 +2676,15 @@ class SessionManager:
     def compact_wait_budget_secs(self) -> float:
         """The compaction wait budget this manager's config is in force with.
 
-        The automatic coordinator and any caller that compacts a session it
-        opened through this manager (the task runner's context-overflow
-        compaction) resolve ``session.compact_wait_secs`` here. The manager's
-        config is the one the process booted with, re-adopted on every live
-        change, so this holds in a standalone ``kirocrew run`` too, where no
-        live-config watcher is armed and ``compact_wait_budget_secs()`` would
-        fall back to the built-in budget.
+        The ONE resolver for ``session.compact_wait_secs``: the automatic
+        coordinator, the task runner's context-overflow compaction, the
+        dashboard ``/compact`` and every chat channel's compact command and
+        near-limit compaction all hold this manager and read the budget here,
+        so no caller can resolve the key differently. The manager's config is
+        the one the process booted with, re-adopted on every live change, so a
+        change applies to the next compaction, and a standalone
+        ``kirocrew run`` (no live-config watcher) still honours the key. Read
+        per call -- a plain attribute read, safe on the event loop.
         """
         return _resolve_compact_wait_secs(self._cfg.session.compact_wait_secs)
 

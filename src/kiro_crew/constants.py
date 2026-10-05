@@ -197,9 +197,9 @@ TOOL_APPROVAL_TIMEOUT = 600.0
 # commands) and automatic compaction deliberately share one budget: the
 # operation is identical, so a shorter manual budget only reports "timed out"
 # on work that is still running and subsequently succeeds. A configured key
-# raises both: the automatic coordinator and the task runner's context-overflow
-# compaction resolve it from the session manager's config, and every dashboard
-# and channel call site passes ``session.compact_wait_budget_secs()``.
+# raises both: every caller -- the automatic coordinator, the task runner,
+# the dashboard and each chat channel -- resolves it through the one
+# ``SessionManager.compact_wait_budget_secs()``.
 COMPACT_WAIT_TIMEOUT_SECS = 300.0
 
 # Wall-clock ceiling on one subagent execution: the default of

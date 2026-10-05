@@ -926,12 +926,11 @@ against sweep completeness, and are torn down at `close_all`.
   points and the task runner's context-overflow compaction through
   `provider.compact()`, the dashboard `/compact` as a chat turn, the
   autocompact through `stream_command("/compact")`. Every route passes the same
-  budget: the autocompact coordinator and the task runner resolve
-  `session.compact_wait_secs` from the manager's config through
-  `SessionManager.compact_wait_budget_secs()` (so a standalone `kirocrew run`,
-  which arms no live-config watcher, still honours it), and each dashboard and
-  channel entry point calls `session.compact_wait_budget_secs()`, which
-  resolves it from the live-config snapshot.
+  budget, resolved in one place: each caller holds the session manager and
+  reads `SessionManager.compact_wait_budget_secs()`, which resolves
+  `session.compact_wait_secs` from the manager's config (re-adopted on every
+  live change, so a standalone `kirocrew run`, which arms no live-config
+  watcher, still honours it).
 
   A backend outside that set takes one of three arms, each a positive
   membership so that an unclassified harness cannot fall into a claim by
