@@ -2824,6 +2824,16 @@ class SessionManager:
         session.provider_switch_replay = False
         return True
 
+    def binding_replay_pending(self, key: str) -> bool:
+        """Whether *key* owes a durable preserved-thinking binding replay.
+
+        Only a binding recovery persists ``replay_pending``; Tool Search and
+        provider-switch replays keep their lease in memory. The dashboard uses
+        this to scope the binding recovery's wider landed-turn rule to that
+        replay alone.
+        """
+        return self._session_map.get_flag(self._fold_key(key), REPLAY_PENDING_FLAG)
+
     async def acommit_provider_switch_replay_sid(self, key: str) -> bool:
         """Durably settle binding recovery, or delegate an ordinary replay."""
         folded = self._fold_key(key)

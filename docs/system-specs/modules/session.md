@@ -48,8 +48,14 @@ clears `replay_pending` off the event loop. Settlement keeps a field-level
 before-image until the write lands. Cancellation conditionally restores the
 prior SID, provider metadata, cwd, and debt only while the same live session
 still owns those fields, then writes a newer compensation sequence so a late
-worker cannot overwrite recovery state. Ordinary write failure restores the
-before-image and leaves it dirty for the normal durability boundary.
+worker cannot overwrite recovery state. That compensation is bounded: it retries
+write failures at most `_REPLAY_DURABLE_WRITE_MAX_ATTEMPTS` times within
+`_REPLAY_DURABLE_WRITE_BUDGET_SECS`, and holds the caller's cancellation for at
+most `_REPLAY_CANCEL_GRACE_SECS` while a worker write is still running. Giving up
+leaves the restored before-image in memory and dirty for the next flush, then
+re-raises the cancellation, so a full or read-only disk cannot pin the turn or
+its session permit. Ordinary write failure restores the before-image and leaves
+it dirty for the normal durability boundary.
 
 Replay suppression is stronger than recovery. A binding discard neither clears
 an existing suppression nor creates debt for an absent session; consuming
@@ -57,10 +63,13 @@ suppression clears `replay_pending`, retires the fallback SID, and disarms the
 live replay lease so removed history cannot return after a restart. A provider-
 confirmed `/clear` likewise wins after native history deletion. It uses a
 separate durable retirement transaction that clears the prior SID and
-`replay_pending` in one payload, never restores their before-image, holds
-cancellation until the write finishes, and retries transient write failures
-fail-closed. The visible clear runs in `finally`, after retirement commits or
-cancellation has been delayed to that boundary.
+`replay_pending` in one payload and never restores their before-image. It holds
+cancellation until the write finishes or the same cancellation grace expires,
+and retries write failures within the same attempt and wall-clock budget.
+Exhausting the budget raises `ReplayDurabilityError` (or the held cancellation)
+with the retired state kept in memory and dirty, so the next flush persists it
+and the failure is visible instead of hanging. The visible clear runs in
+`finally`, after retirement commits or fails within that bound.
 
 The queued binding retry carries its original session key plus slot- and session-
 scoped Stop generations. The queue drain validates those values before dequeue,

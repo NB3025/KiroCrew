@@ -18858,12 +18858,22 @@ async def _run_chat(
         # full-history SID. Exceptions, hard cancellation, synthetic completion,
         # recovery returns and unlanded terminals re-arm the lease; close_all then
         # sees provider_switch_replay and preserves the old SID on restart.
+        # Only a preserved-thinking binding replay (durable ``replay_pending``)
+        # also accepts a terminal that carried no stop reason: that SID has
+        # already been withheld across a discard, and leaving it unpromoted after
+        # a real terminal would replay the rebuilt history again on restart.
+        # Tool Search and provider-switch replays keep the strict ``end_turn``
+        # rule documented in providers.md.
         if _replay_accepted_this_turn:
             try:
+                _binding_replay = state.sessions.binding_replay_pending(session_key) is True
+                _replay_terminal_ok = _stop_reason == STOP_REASON_END_TURN or (
+                    _binding_replay and _stop_reason in (None, "")
+                )
                 _replay_landed = (
                     _turn_landed
                     and _saw_terminal_event
-                    and _stop_reason in (None, "", STOP_REASON_END_TURN)
+                    and _replay_terminal_ok
                     and not _terminal_synthetic
                     and not _had_empty_response_verdict
                 )

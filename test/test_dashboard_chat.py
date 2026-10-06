@@ -12133,7 +12133,6 @@ class TestRunChatRefusalFallback:
     async def test_replay_consume_runs_queued_correction(self, tmp_path, monkeypatch):
         """A correction that wins at refusal replay consume drains as successor."""
         from kiro_crew.dashboard.chat import _run_chat
-        from kiro_crew.dashboard.chat_utils import effective_session_key
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
         streamed: list[str] = []
@@ -12150,16 +12149,10 @@ class TestRunChatRefusalFallback:
         client.stream_command = _stream
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
-        slot._refusal_fallback_primary = "fable-5"
-        slot._refusal_fallback_candidate = "opus-test"
-        slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_fallback_session_key = effective_session_key(slot)
-        slot._refusal_replay_stop_gen = slot._stop_generation
-        slot._refusal_replay_session_stop_gen = 0
+        self._arm_refusal_replay(slot)
         slot.queue_insert(0, "actually do the other thing", kind="")
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
         if slot.task is not None:
             await asyncio.wait_for(slot.task, timeout=10)
 
@@ -12167,14 +12160,12 @@ class TestRunChatRefusalFallback:
         assert "actually do the other thing" in streamed[0]
         assert "retry me" not in streamed[0]
         assert slot._queue == []
-        assert slot._refusal_retry_text == ""
-        assert slot._refusal_replay_queue_id == ""
+        assert not slot.replays.armed(ReplayFamily.CONTENT_FILTER)
 
     @pytest.mark.asyncio
     async def test_replay_consume_runs_pending_steer(self, tmp_path, monkeypatch):
         """A steer that wins at refusal replay consume drains as successor."""
         from kiro_crew.dashboard.chat import _run_chat
-        from kiro_crew.dashboard.chat_utils import effective_session_key
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
         streamed: list[str] = []
@@ -12191,16 +12182,10 @@ class TestRunChatRefusalFallback:
         client.stream_command = _stream
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
-        slot._refusal_fallback_primary = "fable-5"
-        slot._refusal_fallback_candidate = "opus-test"
-        slot._refusal_fallback_attempted = True
-        slot._refusal_retry_text = "retry me"
-        slot._refusal_fallback_session_key = effective_session_key(slot)
-        slot._refusal_replay_stop_gen = slot._stop_generation
-        slot._refusal_replay_session_stop_gen = 0
+        self._arm_refusal_replay(slot)
         slot._pending_steers = ["steer to the replacement"]
 
-        await _run_chat(state, slot, "retry me", _refusal_replay=True)
+        await _run_chat(state, slot, "retry me", _replay=frozenset({ReplayFamily.CONTENT_FILTER}))
         if slot.task is not None:
             await asyncio.wait_for(slot.task, timeout=10)
 
@@ -21903,13 +21888,19 @@ class TestRunChatTransientRetry:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("emit_terminal", "settles"),
-        [(True, True), (False, False)],
-        ids=["real-terminal", "stream-eof"],
+        ("binding_replay", "emit_terminal", "settles"),
+        [(True, True, True), (True, False, False), (False, True, False)],
+        ids=["binding-real-terminal", "binding-stream-eof", "ordinary-replay-strict-end-turn"],
     )
     async def test_visible_replay_without_stop_reason_requires_terminal_event(
-        self, tmp_path, monkeypatch, emit_terminal, settles
+        self, tmp_path, monkeypatch, binding_replay, emit_terminal, settles
     ):
+        """A terminal with no stop reason promotes only a binding replay's SID.
+
+        Tool Search and provider-switch replays keep the strict ``end_turn``
+        rule (providers.md); only the durable binding recovery widens it, and
+        even then only once a real terminal event arrived.
+        """
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
@@ -21923,6 +21914,7 @@ class TestRunChatTransientRetry:
         self._wire_sessions(state, client)
         state.sessions.get_or_create = AsyncMock(return_value=(client, False, False))
         state.sessions.provider_switch_replay_pending = MagicMock(return_value=True)
+        state.sessions.binding_replay_pending = MagicMock(return_value=binding_replay)
         state.sessions.mark_provider_switch_replay = MagicMock(return_value=True)
         state.sessions.acommit_provider_switch_replay_sid = AsyncMock(return_value=True)
         slot = state.get_or_create_slot("absent-stop-replay")
