@@ -44,9 +44,9 @@ from kiro_crew.metrics.sessions import (
     record_sessions_ended,
 )
 from kiro_crew.process_identity import ProcessHandle, process_handle_of
+from kiro_crew.session_map import REPLAY_PENDING_FLAG
 from kiro_crew.session_pool import pool_kiro_agent
 from kiro_crew.start_priority import PrioritySemaphore
-from kiro_crew.session_map import REPLAY_PENDING_FLAG
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 

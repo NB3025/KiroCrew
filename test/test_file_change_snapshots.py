@@ -477,9 +477,16 @@ class TestFlushFileChanges:
             and isinstance(node.test.comparators[0], ast.Name)
             and node.test.comparators[0].id == "EVENT_CLEAR_STATUS"
         ]
+        # The arm's resets may sit in a ``try/finally`` so a failed durable
+        # replay retirement still clears the window; both bodies count.
+        stmts = list(clear.body)
+        for stmt in clear.body:
+            if isinstance(stmt, ast.Try):
+                stmts.extend(stmt.body)
+                stmts.extend(stmt.finalbody)
         resets = {
             target.id
-            for stmt in clear.body
+            for stmt in stmts
             if isinstance(stmt, ast.Assign)
             and isinstance(stmt.value, ast.Constant)
             and stmt.value.value == ""

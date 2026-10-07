@@ -123,7 +123,6 @@ from kiro_crew.acp.runtime_process_tree import ChildRecord
 from kiro_crew.acp.session_mcp import agent_spec_snapshot, session_mcp_deny_rules
 from kiro_crew.acp.transport_errors import (
     AcpAuthRequired,
-    AcpConversationBindingMismatch,
     AcpError,
     AcpModelUnavailable,
     AcpProcessDied,
@@ -11963,6 +11962,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_COMPACTION_TRANSIENT_MARKERS",
         "_COMPACTION_WALK_MAX_DEPTH",
         "_walk_compaction_payload",
+        "AcpConversationBindingMismatch",
         "AcpPermissionNeeded",
         "AcpRegistrationRateLimited",
         "AcpPromptBusy",
@@ -12452,6 +12452,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         PROVIDER_ERROR_USAGE_LIMIT,
         SANDBOX_LAYER_CREW,
         SANDBOX_LAYER_HARNESS,
+        AcpConversationBindingMismatch,
         AcpPermissionNeeded,
         AcpPromptBusy,
         AcpRegistrationRateLimited,

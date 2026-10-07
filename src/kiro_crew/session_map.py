@@ -117,7 +117,7 @@ MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
 SUPPRESS_REPLAY_FLAG = "suppress_replay"
 
 #: A fresh native conversation is rebuilding from visible Kiro Crew history.
-#: The prior SID remains the durable fallback, but allocation must not resume it
+#: The prior SID stays recorded in the entry, but allocation never resumes it
 #: while this flag is set. Settlement replaces the SID and clears the debt in
 #: one persistence transaction.
 REPLAY_PENDING_FLAG = "replay_pending"
@@ -237,6 +237,50 @@ _FLUSH_DEBOUNCE_SECS = 0.05
 # Cancellation cannot return until its newer compensation snapshot lands.
 _REPLAY_COMPENSATION_INITIAL_DELAY_SECS = 0.05
 _REPLAY_COMPENSATION_MAX_DELAY_SECS = 1.0
+#: Write attempts a replay compensation or confirmed-clear retirement makes
+#: before it stops retrying. A full or read-only disk fails every attempt, so an
+#: unbounded loop would hold the turn and its session permit forever.
+_REPLAY_DURABLE_WRITE_MAX_ATTEMPTS = 6
+#: Wall-clock ceiling across those attempts, whichever is reached first.
+_REPLAY_DURABLE_WRITE_BUDGET_SECS = 10.0
+#: How long a cancelled caller still waits for an in-flight worker write before
+#: it stops waiting and lets the cancellation through. The worker thread keeps
+#: running; the ``_write_payload`` sequence check drops it if a newer snapshot
+#: lands first, and the in-memory state stays dirty for the next flush.
+_REPLAY_CANCEL_GRACE_SECS = 5.0
+
+
+class ReplayDurabilityError(RuntimeError):
+    """A replay retirement could not reach disk within its retry budget.
+
+    The in-memory map already holds the retired state and is marked dirty, so
+    the next durability boundary persists it; this error only reports that the
+    synchronous guarantee could not be given now.
+    """
+
+
+class _ReplayWriteBudget:
+    """Attempt and wall-clock bound shared by the replay durability retry loops."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._deadline = self._loop.time() + _REPLAY_DURABLE_WRITE_BUDGET_SECS
+        self._delay = _REPLAY_COMPENSATION_INITIAL_DELAY_SECS
+        self.attempts = 0
+
+    def spend(self) -> bool:
+        """Record one failed attempt; True while another attempt is allowed."""
+        self.attempts += 1
+        return (
+            self.attempts < _REPLAY_DURABLE_WRITE_MAX_ATTEMPTS
+            and self._loop.time() < self._deadline
+        )
+
+    def next_delay(self) -> float:
+        """The backoff before the next attempt, clipped to the remaining budget."""
+        delay = min(self._delay, max(0.0, self._deadline - self._loop.time()))
+        self._delay = min(self._delay * 2, _REPLAY_COMPENSATION_MAX_DELAY_SECS)
+        return delay
 
 
 def _has_durable_flag(entry: dict) -> bool:
@@ -2627,42 +2671,109 @@ class SessionMap:
         return self._serialize()
 
     @staticmethod
+    def _drain_abandoned(task: "asyncio.Task[object]") -> None:
+        """Retrieve an abandoned worker's outcome so it is never reported unretrieved."""
+
+        def _drain(done: "asyncio.Task[object]") -> None:
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(_drain)
+
+    @staticmethod
+    async def _await_task_despite_cancellation(
+        task: "asyncio.Task[object]",
+        cancelled: "list[asyncio.CancelledError]",
+    ) -> None:
+        """Finish *task* while retaining the first cancellation for its caller.
+
+        A cancellation is held only for ``_REPLAY_CANCEL_GRACE_SECS``: a worker
+        write that is still running after that (a hung disk) is abandoned and the
+        first cancellation is raised, so a Stop or shutdown cannot be swallowed
+        indefinitely. The abandoned thread may still land; ``_write_payload``
+        drops it if a newer snapshot already reached disk.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _REPLAY_CANCEL_GRACE_SECS if cancelled else None
+        while not task.done():
+            if deadline is None:
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    cancelled.append(exc)
+                    deadline = loop.time() + _REPLAY_CANCEL_GRACE_SECS
+                continue
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                SessionMap._drain_abandoned(task)
+                raise cancelled[0]
+            try:
+                await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError as exc:
+                if not cancelled:
+                    cancelled.append(exc)
+        task.result()
+
+    @staticmethod
     async def _sleep_despite_cancellation(delay: float) -> None:
+        cancelled: list[asyncio.CancelledError] = []
         sleeper = asyncio.create_task(asyncio.sleep(delay))
-        while True:
-            try:
-                await asyncio.shield(sleeper)
-                return
-            except asyncio.CancelledError:
-                if sleeper.done():
-                    sleeper.result()
-                    return
+        await SessionMap._await_task_despite_cancellation(sleeper, cancelled)
 
-    async def _write_payload_despite_cancellation(self, payload: str, seq: int) -> None:
+    async def _write_payload_despite_cancellation(
+        self,
+        payload: str,
+        seq: int,
+        cancelled: "list[asyncio.CancelledError] | None" = None,
+    ) -> None:
+        held: list[asyncio.CancelledError] = [] if cancelled is None else cancelled
         writer = asyncio.create_task(asyncio.to_thread(self._write_payload, payload, seq))
-        while True:
-            try:
-                await asyncio.shield(writer)
-                return
-            except asyncio.CancelledError:
-                if writer.done():
-                    writer.result()
-                    return
+        await self._await_task_despite_cancellation(writer, held)
 
-    async def _compensate_replay_settlement(self, settlement: _ReplaySettlement) -> None:
-        delay = _REPLAY_COMPENSATION_INITIAL_DELAY_SECS
+    async def _compensate_replay_settlement(
+        self, settlement: _ReplaySettlement, cancellation: asyncio.CancelledError
+    ) -> None:
+        """Land the before-image of a cancelled settlement, within a bounded budget.
+
+        Every attempt restores the before-image in memory first, so giving up
+        leaves the map correct in-process and dirty for the next durability
+        boundary; only a crash before that flush can still see the cancelled
+        settlement on disk. The caller re-raises its cancellation either way.
+        The caller is ALREADY cancelled, so each write's cancellation grace
+        starts at once instead of waiting for a second cancel that may never
+        come.
+        """
+        budget = _ReplayWriteBudget()
         while True:
             payload, seq = self._rollback_replay_settlement(settlement)
             try:
-                await self._write_payload_despite_cancellation(payload, seq)
+                await self._write_payload_despite_cancellation(payload, seq, [cancellation])
                 return
+            except asyncio.CancelledError:
+                self._restore_dirty()
+                logger.error(
+                    "Replay settlement compensation for %s still writing after the "
+                    "cancellation grace; the before-image stays dirty for the next flush",
+                    settlement.key,
+                )
+                raise
             except Exception:
                 self._restore_dirty()
-                logger.exception(
-                    "Replay settlement compensation failed; retrying before cancellation exits"
+                if not budget.spend():
+                    logger.error(
+                        "Replay settlement compensation for %s abandoned after %d attempts; "
+                        "the before-image stays dirty for the next flush",
+                        settlement.key,
+                        budget.attempts,
+                        exc_info=True,
+                    )
+                    return
+                logger.warning(
+                    "Replay settlement compensation failed (attempt %d); retrying",
+                    budget.attempts,
+                    exc_info=True,
                 )
-                await self._sleep_despite_cancellation(delay)
-                delay = min(delay * 2, _REPLAY_COMPENSATION_MAX_DELAY_SECS)
+                await self._sleep_despite_cancellation(budget.next_delay())
 
     async def _settle_replay(
         self,
@@ -2684,8 +2795,8 @@ class SessionMap:
         )
         try:
             await asyncio.to_thread(self._write_payload, settlement.payload, settlement.seq)
-        except asyncio.CancelledError:
-            await self._compensate_replay_settlement(settlement)
+        except asyncio.CancelledError as exc:
+            await self._compensate_replay_settlement(settlement, exc)
             raise
         except Exception:
             self._rollback_replay_settlement(settlement)
@@ -2728,6 +2839,97 @@ class SessionMap:
             replay_flag=replay_flag,
             still_current=still_current,
         )
+
+    @_guarded
+    def _prepare_replay_retirement(
+        self, key: str, replay_flag: str, sid: str | None, provider: str, cwd: str
+    ) -> tuple[str, int]:
+        """Retire a confirmed-clear fallback and debt in one payload.
+
+        The pre-clear SID is always stashed. When the live provider's own SID is
+        known it becomes the resume pointer: that conversation is the cleared
+        one, so a restart resumes what was said after the clear instead of
+        rebuilding it from the chat log.
+        """
+        key = canonical_key(key)
+        entry = self._ensure_entry(key)
+        _stash_and_clear_sid(entry)
+        if sid:
+            entry["sid"] = sid
+            if provider:
+                entry["provider"] = provider
+            if cwd:
+                entry["cwd"] = cwd
+        flags = entry.get("flags")
+        if isinstance(flags, dict):
+            flags.pop(replay_flag, None)
+            if not flags:
+                entry.pop("flags", None)
+        self._dirty = False
+        return self._serialize()
+
+    async def retire_replay(
+        self,
+        key: str,
+        *,
+        replay_flag: str,
+        sid: str | None = None,
+        provider: str = "",
+        cwd: str = "",
+    ) -> None:
+        """Durably retire history after the provider confirmed deletion.
+
+        Unlike an ordinary replay settlement, this operation never restores its
+        before-image: the native history is already gone. *sid*, when given, is
+        the live (cleared) conversation and replaces the stashed pre-clear SID.
+        Cancellation is held until the retirement reaches disk or the
+        cancellation grace expires, and
+        write failures retry within ``_REPLAY_DURABLE_WRITE_MAX_ATTEMPTS`` /
+        ``_REPLAY_DURABLE_WRITE_BUDGET_SECS``. Exhausting the budget raises
+        :class:`ReplayDurabilityError` (or the held cancellation) with the
+        retired state kept in memory and dirty, so the next flush persists it.
+        """
+        payload, seq = self._prepare_replay_retirement(key, replay_flag, sid, provider, cwd)
+        cancelled: list[asyncio.CancelledError] = []
+        budget = _ReplayWriteBudget()
+        while True:
+            writer = asyncio.create_task(asyncio.to_thread(self._write_payload, payload, seq))
+            try:
+                await self._await_task_despite_cancellation(writer, cancelled)
+                break
+            except asyncio.CancelledError:
+                self._restore_dirty()
+                logger.error(
+                    "Confirmed-clear replay retirement for %s still writing after the "
+                    "cancellation grace; the retired state stays dirty for the next flush",
+                    key,
+                )
+                raise
+            except Exception as exc:
+                self._restore_dirty()
+                if not budget.spend():
+                    logger.error(
+                        "Confirmed-clear replay retirement for %s abandoned after %d attempts; "
+                        "the retired state stays dirty for the next flush",
+                        key,
+                        budget.attempts,
+                        exc_info=True,
+                    )
+                    if cancelled:
+                        raise cancelled[0] from exc
+                    raise ReplayDurabilityError(
+                        f"replay retirement for {key} did not reach disk after "
+                        f"{budget.attempts} attempts"
+                    ) from exc
+                logger.warning(
+                    "Confirmed-clear replay retirement failed (attempt %d); retrying",
+                    budget.attempts,
+                    exc_info=True,
+                )
+                sleeper = asyncio.create_task(asyncio.sleep(budget.next_delay()))
+                await self._await_task_despite_cancellation(sleeper, cancelled)
+        if cancelled:
+            raise cancelled[0]
 
     def get_flag(self, key: str, flag: str) -> bool:
         """Return the value of a per-conversation boolean *flag* (default False)."""
