@@ -2819,12 +2819,26 @@ class SessionManager:
         return True
 
     def commit_provider_switch_replay_sid(self, key: str) -> bool:
-        """Promote a live replay SID through the legacy non-durable path."""
+        """Settle replay, promoting the live ACP SID when one was deferred.
+
+        Allocation leaves the prior resumable SID in ``SessionMap`` only for an
+        ACP provider that explicitly defers promotion. Other providers publish
+        their own SID during allocation, so a landed replay consumes the lease
+        without another mapping write. This keeps cross-provider history replay
+        one-shot instead of re-arming forever on a non-ACP session. A durable
+        binding replay settles through ``acommit_provider_switch_replay_sid``.
+        """
         folded = self._fold_key(key)
         session = self._sessions.get(folded)
         if session is None or not session.provider_switch_replay:
             return False
-        if session.retire_on_identity_change or not _is_acp_provider(session.provider):
+        # Kept as its own early return: the identity-fence contract
+        # (test_every_sid_writer_is_registration_or_identity_fenced) recognises
+        # only a bare ``retire_on_identity_change`` test before the SID write.
+        if session.retire_on_identity_change:
+            session.provider_switch_replay = False
+            return True
+        if not _is_acp_provider(session.provider):
             session.provider_switch_replay = False
             return True
         client = getattr(session.provider, "client", None)
@@ -2839,6 +2853,16 @@ class SessionManager:
         )
         session.provider_switch_replay = False
         return True
+
+    def binding_replay_pending(self, key: str) -> bool:
+        """Whether *key* owes a durable preserved-thinking binding replay.
+
+        Only a binding recovery persists ``replay_pending``; Tool Search and
+        provider-switch replays keep their lease in memory. The dashboard uses
+        this to scope the binding recovery's wider landed-turn rule to that
+        replay alone.
+        """
+        return self._session_map.get_flag(self._fold_key(key), REPLAY_PENDING_FLAG)
 
     async def acommit_provider_switch_replay_sid(self, key: str) -> bool:
         """Durably settle binding recovery, or delegate an ordinary replay."""
@@ -2875,6 +2899,24 @@ class SessionManager:
             still_current=still_current,
         )
         session.provider_switch_replay = False
+        return True
+
+    async def aretire_provider_switch_replay(self, key: str) -> bool:
+        """Retire replay debt and its fallback after native history deletion."""
+        folded = self._fold_key(key)
+        session = self._sessions.get(folded)
+        in_memory = bool(session is not None and session.provider_switch_replay)
+        durable = self._session_map.get_flag(folded, REPLAY_PENDING_FLAG)
+        if not (in_memory or durable):
+            return False
+        try:
+            await self._session_map.retire_replay(
+                folded,
+                replay_flag=REPLAY_PENDING_FLAG,
+            )
+        finally:
+            if session is not None:
+                session.provider_switch_replay = False
         return True
 
     def consume_provider_switch_replay(self, key: str) -> bool:

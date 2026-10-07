@@ -35,6 +35,7 @@ from kiro_crew.runtime_ownership import (
     release_session_lease,
 )
 from kiro_crew.session_lifecycle import adopt_parked_queue
+from kiro_crew.session_map import REPLAY_PENDING_FLAG
 from kiro_crew.start_priority import (
     START_QUEUE_COLD_START,
     START_QUEUE_COMPANION,
@@ -43,7 +44,6 @@ from kiro_crew.start_priority import (
     StartPriority,
     notify_start_queue,
 )
-from kiro_crew.session_map import REPLAY_PENDING_FLAG
 from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
