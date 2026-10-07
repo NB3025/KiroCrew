@@ -787,6 +787,7 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "_attachment_meta",
         "_synthetic_payload",
         "_replay",
+        "_binding_recovery_fence",
         "_synthetic_recovery_turn",
         "_replays_completion",
         "_steer_possibly_delivered",

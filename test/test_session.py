@@ -25,8 +25,8 @@ from kiro_crew.session import (
     SessionEndingError,
     SessionManager,
 )
-from kiro_crew.start_priority import StartPriority
 from kiro_crew.session_map import REPLAY_PENDING_FLAG
+from kiro_crew.start_priority import StartPriority
 
 
 @pytest.fixture
@@ -6393,6 +6393,51 @@ class TestLoadRecoveryHistoryReplay:
         assert mgr.mark_provider_switch_replay("thread1") is True
         assert mgr.provider_switch_replay_pending("thread1") is True
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_clear_discards_replay_fallback_across_restart(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=self._factory(True))
+        await mgr.get_or_create("thread1")
+        session = next(iter(mgr._sessions.values()))
+        session.provider_switch_replay = True
+        mgr._session_map.set("thread1", "old-full-history-sid", provider="acp")
+        mgr._session_map.set_flag("thread1", REPLAY_PENDING_FLAG, True)
+
+        assert (
+            await asyncio.wait_for(mgr.aretire_provider_switch_replay("thread1"), timeout=10)
+            is True
+        )
+        assert session.provider_switch_replay is False
+        assert _raw_sid(mgr, "thread1") == ""
+        assert mgr._session_map.get_flag("thread1", REPLAY_PENDING_FLAG) is False
+        await mgr.close_all()
+
+        restarted = SessionManager(cfg, provider_factory=self._factory(False))
+        assert _raw_sid(restarted, "thread1") == ""
+        assert restarted._session_map.get_flag("thread1", REPLAY_PENDING_FLAG) is False
+        await restarted.close_all()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_clear_discards_in_memory_replay_fallback_across_restart(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=self._factory(True))
+        await mgr.get_or_create("thread1")
+        session = next(iter(mgr._sessions.values()))
+        session.provider_switch_replay = True
+        mgr._session_map.set("thread1", "old-full-history-sid", provider="acp")
+        assert mgr._session_map.get_flag("thread1", REPLAY_PENDING_FLAG) is False
+
+        assert (
+            await asyncio.wait_for(mgr.aretire_provider_switch_replay("thread1"), timeout=10)
+            is True
+        )
+        assert session.provider_switch_replay is False
+        assert _raw_sid(mgr, "thread1") == ""
+        await mgr.close_all()
+
+        restarted = SessionManager(cfg, provider_factory=self._factory(False))
+        assert _raw_sid(restarted, "thread1") == ""
+        assert restarted._session_map.get_flag("thread1", REPLAY_PENDING_FLAG) is False
+        await restarted.close_all()
 
     @pytest.mark.asyncio
     async def test_non_acp_provider_switch_replay_settles_without_sid_promotion(self, cfg):
