@@ -40,31 +40,52 @@ and recent-project save. A refused save rolls back only its own project token
 and cannot arm a deferred reset or eager spawn for the replacement.
 
 A preserved-thinking binding recovery writes `replay_pending` durably before it
-removes the rejected live provider. The prior SID remains a restart fallback,
-but allocation never passes it to `session/load`; it starts a fresh provider,
+removes the rejected live provider. The prior SID stays recorded in the entry
+(allocation still reads its stored cwd), but it is not a resume fallback:
+while `replay_pending` is set allocation never passes it to `session/load`; it
+starts a fresh provider,
 arms the existing `provider_switch_replay` lease, and withholds the fresh SID.
 A landed non-synthetic, non-empty turn atomically promotes the fresh SID and
 clears `replay_pending` off the event loop. Settlement keeps a field-level
 before-image until the write lands. Cancellation conditionally restores the
 prior SID, provider metadata, cwd, and debt only while the same live session
 still owns those fields, then writes a newer compensation sequence so a late
-worker cannot overwrite recovery state. Ordinary write failure restores the
-before-image and leaves it dirty for the normal durability boundary.
+worker cannot overwrite recovery state. That compensation is bounded: it retries
+write failures at most `_REPLAY_DURABLE_WRITE_MAX_ATTEMPTS` times within
+`_REPLAY_DURABLE_WRITE_BUDGET_SECS`, and holds the caller's cancellation for at
+most `_REPLAY_CANCEL_GRACE_SECS` while a worker write is still running. Giving up
+leaves the restored before-image in memory and dirty for the next flush, then
+re-raises the cancellation, so a full or read-only disk cannot pin the turn or
+its session permit. Ordinary write failure restores the before-image and leaves
+it dirty for the normal durability boundary.
 
 Replay suppression is stronger than recovery. A binding discard neither clears
 an existing suppression nor creates debt for an absent session; consuming
 suppression clears `replay_pending`, retires the fallback SID, and disarms the
 live replay lease so removed history cannot return after a restart. A provider-
-confirmed `/clear` likewise wins after native history deletion: cancellation or
-failure of the awaited SID settlement cannot prevent the visible clear or leave
-the live replay lease armed.
+confirmed `/clear` likewise wins after native history deletion. It uses a
+separate durable retirement transaction that stashes the prior SID as
+`discarded_sid`, clears `replay_pending`, and never restores their before-image,
+all in one payload. When the live ACP session has its own SID (and is not
+identity-fenced), that SID becomes the resume pointer, so a restart resumes the
+cleared conversation and the turns after it; otherwise the pointer is left
+empty. It holds
+cancellation until the write finishes or the same cancellation grace expires,
+and retries write failures within the same attempt and wall-clock budget.
+Exhausting the budget raises `ReplayDurabilityError` (or the held cancellation)
+with the retired state kept in memory and dirty, so the next flush persists it
+and the failure is visible instead of hanging. The visible clear runs in
+`finally`, after retirement commits or fails within that bound.
 
 The queued binding retry carries its original session key plus slot- and session-
 scoped Stop generations. The queue drain validates those values before dequeue,
 and the runner validates them again at coroutine consumption and after awaited
 provider/context preparation. Stop, a newer message, a pending steer, or a rebind
 therefore cancels stale replay before it can open a provider turn; user successors
-continue, while an aborted replay cannot trigger automatic synthesis.
+continue through the shared pre-dispatch-abort drain, while an aborted replay
+cannot trigger automatic synthesis. The poisoned-conversation one-shot re-arms
+only after a real, non-synthetic terminal with no refusal or empty-response
+verdict; refusal, synthetic completion, and plain EOF leave it spent.
 
 ## Dashboard app launch intents
 
@@ -1471,7 +1492,7 @@ against sweep completeness, and are torn down at `close_all`.
 | `cancel_current(key, *, wait_ack_timeout=0.0)` | Cancel in-flight operation without destroying session. Returns `CancelOutcome`. Default `wait_ack_timeout=0.0` preserves fire-and-forget behavior for internal callers (taskrunner, subagent, llm_helpers). |
 | `stop_turn(key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None)` | Cooperative stop with kill fallback. Returns `StopOutcome` (`"soft"`, `"hard"`, `"idle"`, or `"compacting"`). A cooperative stop on a session whose own automatic `/compact` turn holds it answers `"compacting"` BEFORE recording the Stop or clearing anything: cancelling that turn would fail the compaction and recycle the session. Otherwise records the Stop, clears the queue unless `preserve_queue`, then sends `session/cancel` and waits up to `agent.soft_stop_budget_secs`; falls back to `reset()` + eager respawn on timeout or error. `force=True` is never declined: it skips cancel and goes straight to hard kill. `on_soft`/`on_hard` callbacks fire before return. Callers with side effects of their own (a queue clear, a pending-file unlink, a task pop) probe `session_lifecycle.compaction_in_flight` first and run them only after an outcome other than `"compacting"`. |
 | `reset(key, *, expect_session=None, skip_if_busy=False, clear_conversation=False)` | Kill session; returns `bool` (True iff a session was actually torn down). Does NOT delete session map entry (kiro-cli file persists for future resume). Optional guards evaluated atomically under the lock with the pop, used by the RSS-recycle watchdog: `expect_session` only resets if that exact session object still occupies the key (guards against recycling a reset+recreated session on a stale off-lock RSS reading); `skip_if_busy` skips when the current session's semaphore is held so a live stream is never cut mid-turn. `clear_conversation=True` additionally clears the native resume sid in the SAME event-loop tick as the pop (entry + channel bindings survive, as in `_recycle_held`) — used by the still-critical post-compaction escalation so the overflowed conversation is not reloaded, without a delayed clear ever erasing a racing successor's sid. Queued follow-ups survive a recycling reset: in the same lock hold as the pop, every entry not marked in the session's `cancelled` set is moved off the popped queue and parked (`session_lifecycle._park_queue`, bounded by `PARKED_QUEUE_MAX` / `PARKED_QUEUE_TOTAL_MAX`, files kept), and once the teardown ends the reset starts a successor under the popped session's own identity (`allocation_identity`, shared with `session_compaction._restart_held`: agent, approval policy, cwd, bound channel, selected model and crew member; a caller's `extra_env` is not recorded on a session and is not carried), so it registers, adopts them at the queue head (`adopt_parked_queue`) and its release wakes their channels' drains. The respawn re-arms the successor's first-turn observation (`FRESH`, or `RESUMED` after a native resume) from the flags its start returned before releasing it, so the first queued turn, not the respawn, sees `is_new`; a failed native resume therefore still replays Kiro Crew history into that turn. A default-argument respawn would be wrong here: a later claim takes a live session as-is, so it would answer every later message as the default agent. Without this a failure-path reset (`AcpPromptBusy` in `slack/handler.py`, the circuit breaker) silently dropped messages sent while the failing turn ran, because the failed turn's end-of-turn `dequeue` finds no live session. Cancelled entries stay on the popped queue and are unlinked as before. `ends_conversation=True` keeps dropping the queue: the caller is ending the conversation. |
-| `discard_conversation(key, *, preserve_replay_fallback=False)` | Kill session and, by default, clear only the resume sid (`SessionMap.clear_sid`). With `preserve_replay_fallback=True`, require a live session, persist `replay_pending`, and retain the prior SID as a restart fallback until replay settlement — the map ENTRY survives, preserving Slack thread/channel linkage and the reverse thread→session index. The cleared sid is stashed as `discarded_sid` in the entry, so the discard is diagnosable and manually reversible (the native conversation persists on disk; only the pointer is dropped). Every path that empties `sid` in place records what it dropped, through one shared `_stash_and_clear_sid` — this discard, the provider switch, the startup prune and the per-read stale repair — because a history reader answers from that field and cannot tell which path wrote it, so a field written by only some of them holds a genuine id that is not the latest one. The next turn cold-starts a fresh native conversation instead of `session/load`-ing the old one. Used by the poisoned-conversation escalation in `chat_runner` (canary-verified backend rejection of a specific persisted conversation), by typed `IMAGE_FORMAT_UNSUPPORTED` recovery when a dashboard turn supplied no new attachment (the native history retains unsupported image bytes while the bounded Kiro Crew replay is text-only), and by the Slack / Discord / Telegram `/compact` failure recovery: the conversation is unusable but the session's channel identity must persist. This is the shape every HOUSEKEEPING teardown takes — `SessionMap.prune` refuses to delete an entry carrying a channel binding, and `_recycle_held` clears the sid for the same reason. Only an explicit user action (`destroy`) may remove a channel identity. Sits between `reset` (sid kept, resume expected) and `remove` (entry deleted, no resume). |
+| `discard_conversation(key, *, preserve_replay_fallback=False)` | Kill session and, by default, clear only the resume sid (`SessionMap.clear_sid`). With `preserve_replay_fallback=True`, require a live session, persist `replay_pending`, and keep the prior SID recorded (never resumed while `replay_pending` is set) until replay settlement — the map ENTRY survives, preserving Slack thread/channel linkage and the reverse thread→session index. The cleared sid is stashed as `discarded_sid` in the entry, so the discard is diagnosable and manually reversible (the native conversation persists on disk; only the pointer is dropped). Every path that empties `sid` in place records what it dropped, through one shared `_stash_and_clear_sid` — this discard, the provider switch, the startup prune and the per-read stale repair — because a history reader answers from that field and cannot tell which path wrote it, so a field written by only some of them holds a genuine id that is not the latest one. The next turn cold-starts a fresh native conversation instead of `session/load`-ing the old one. Used by the poisoned-conversation escalation in `chat_runner` (canary-verified backend rejection of a specific persisted conversation), by typed `IMAGE_FORMAT_UNSUPPORTED` recovery when a dashboard turn supplied no new attachment (the native history retains unsupported image bytes while the bounded Kiro Crew replay is text-only), and by the Slack / Discord / Telegram `/compact` failure recovery: the conversation is unusable but the session's channel identity must persist. This is the shape every HOUSEKEEPING teardown takes — `SessionMap.prune` refuses to delete an entry carrying a channel binding, and `_recycle_held` clears the sid for the same reason. Only an explicit user action (`destroy`) may remove a channel identity. Sits between `reset` (sid kept, resume expected) and `remove` (entry deleted, no resume). |
 | `remove(key)` | Shut down a session but PRESERVE the session map entry — the kiro-cli session files remain on disk, so a future `get_or_create` restores the conversation losslessly via `session/load`. For revivable teardown (tab close, agent switch, idle kill). Permanent deletion is `destroy(key)`. |
 | `destroy(key)` | Permanently remove the live provider, compaction override, and session-map entry. The map entry is deleted in the yield-free registry-pop span before the awaited end metric, so a dashboard slot cannot adopt the predecessor binding during that metric write. |
 | `destroy_if(key, expected_generation, should_destroy, *, preserve_autocompact_override=False)` | Conditional permanent removal for the monotonic canonical-key generation captured by `session_generation(key)`. Under the manager lock it requires no current allocation/claim reservation, requires the generation to remain equal, requires the current session semaphore to be idle, then evaluates the synchronous slot-owner predicate immediately before the registry pop and yield-free session-map delete. Any reservation, generation mismatch (including absent→successor→absent ABA), busy session, false predicate, or predicate exception leaves provider, override, and map untouched. History deletion passes `preserve_autocompact_override=True` because another process can claim the same logical transcript; ordinary conditional and unconditional destroy keep clearing the old override. Returns whether destruction occurred. |

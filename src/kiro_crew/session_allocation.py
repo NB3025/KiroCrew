@@ -35,6 +35,7 @@ from kiro_crew.runtime_ownership import (
     release_session_lease,
 )
 from kiro_crew.session_lifecycle import adopt_parked_queue
+from kiro_crew.session_map import REPLAY_PENDING_FLAG
 from kiro_crew.start_priority import (
     START_QUEUE_COLD_START,
     START_QUEUE_COMPANION,
@@ -43,7 +44,6 @@ from kiro_crew.start_priority import (
     StartPriority,
     notify_start_queue,
 )
-from kiro_crew.session_map import REPLAY_PENDING_FLAG
 from kiro_crew.validation import bounded_session_id
 
 if TYPE_CHECKING:
@@ -2301,8 +2301,9 @@ class SessionAllocationService:
         if not is_stateless:
             mapped_resume_sid = owner._session_map.get(key)
             durable_replay_pending = owner._session_map.get_flag(key, REPLAY_PENDING_FLAG)
-        # The mapped SID remains the restart fallback while binding recovery is
-        # unfinished, but resuming it would send the same rejected thinking prefix.
+        # The mapped SID stays recorded (its stored cwd is still read below) while
+        # binding recovery is unfinished, but resuming it would send the same
+        # rejected thinking prefix, so it is never a resume target.
         resume_sid = None if durable_replay_pending else mapped_resume_sid
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
